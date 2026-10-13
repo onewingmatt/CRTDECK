@@ -97,9 +97,19 @@ The parts that cannot be checked off-device, and how to do them on the BC-250:
   `Failed to parse reshade fx shader module: <path>(line, col): error Xnnnn`.
   A `Couldn't find texture with name: V__BackBufferTex` line is benign.
   Two traps: Gamescope only reloads the effect on a **new composited frame**
-  (an idle screen can sit for 10+ seconds, so poll rather than sleeping a
-  fixed second), and it **caches by path** (re-pointing at a path it already
-  parsed logs nothing — use a fresh filename to force a parse).
+  (an idle screen can sit for 10+ seconds), and it **caches by path**
+  (re-pointing at a path it already parsed logs nothing — use a fresh filename
+  to force a parse). To force a frame rather than wait for one, change the
+  Steam UI page — `steam steam://open/downloads`, alternating with another
+  page so each launch is a change. Expect ~85% coverage per pass and retry the
+  remainder; `xdotool mousemove` and `glxgears` both failed to produce frames.
+- **Known limitation:** a handful of community shaders are rejected by
+  Gamescope's compiler on upstream type diagnostics (`warning X3206: implicit
+  truncation of vector type`, `warning X4576: ... semantic does not match
+  vertex shader one`). Gamescope treats them as fatal, so those presets do
+  nothing, and they cannot be fixed without editing the upstream shader. Of the
+  75 shaders in the two packs, 61 compile on Gamescope 3.16.28-ogc3+ and 13 are
+  rejected.
 - **Does the panel's data contract hold?** The panel takes the whole plugin
   down if a preset hands it a slider whose `default` sits outside `[min, max]`.
   Check the real list, not a guess: assert `min <= default <= max`, `step > 0`,
