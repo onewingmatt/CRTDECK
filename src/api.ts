@@ -25,6 +25,13 @@ export interface CommunityPack {
   installed: boolean;
 }
 
+export interface ManagedApp {
+  name: string;
+  relpath: string;
+  /** True when we had to synthesize %command% for this game's options. */
+  added_command?: boolean;
+}
+
 export interface StatusInfo {
   reshade_supported: boolean;
   xprop_available: boolean;
@@ -36,6 +43,12 @@ export interface StatusInfo {
   params: Record<string, Record<string, number>>;
   presets: Preset[];
   community_packs: CommunityPack[];
+  /**
+   * Games whose launch options carry a DeckyCRT wrapper, keyed by app id.
+   * Persisted so Off / System-wide can clean up wrappers for games that are
+   * not running — the wrapper lives in Steam's saved options, not in memory.
+   */
+  managed_apps: Record<string, ManagedApp>;
 }
 
 export interface ActionResult {
@@ -62,3 +75,23 @@ export const downloadPack =
   callable<[pack_id: string], ActionResult>("download_pack");
 export const removePack =
   callable<[pack_id: string], ActionResult>("remove_pack");
+
+/**
+ * Remember (or forget) a game whose launch options carry our wrapper.
+ *
+ * The registry is what lets a later Off / System-wide switch clean up a game
+ * that has since exited: the wrapper outlives the process.
+ */
+export const setManagedApp = callable<
+  [
+    app_id: number,
+    name: string,
+    relpath: string,
+    enabled: boolean,
+    added_command: boolean,
+  ],
+  ActionResult
+>("set_managed_app");
+
+export const clearManagedApps =
+  callable<[], ActionResult>("clear_managed_apps");

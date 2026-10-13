@@ -17,13 +17,15 @@ cd "$(dirname "$0")/.."
 echo "== python syntax =="
 python3 -m py_compile main.py && echo "   main.py OK"
 
+echo "== launch-option unit tests =="
+node scripts/test-launch-options.ts
+
+echo "== backend harness (stubbed decky, throwaway home) =="
+python3 scripts/test-backend.py | sed 's/^/   /'
+
 echo "== typescript (gate) =="
-if command -v pnpm >/dev/null 2>&1; then
-  pnpm exec tsc --noEmit
-  echo "   tsc clean"
-else
-  echo "   pnpm not found — skipping typecheck" >&2
-fi
+pnpm exec tsc --noEmit
+echo "   tsc clean"
 
 echo "== build =="
 pnpm run build >/dev/null
@@ -31,7 +33,7 @@ FIRST=$(sha256sum dist/index.js | cut -d' ' -f1)
 echo "   dist/index.js $FIRST"
 
 echo "== bundle contents =="
-for sym in toastError sliderValue paramIsUsable; do
+for sym in toastError sliderValue paramIsUsable installWrapper removeWrapper foreign-gamescope RegisterForAppDetails; do
   grep -q "$sym" dist/index.js || { echo "   MISSING $sym in bundle" >&2; exit 1; }
   echo "   $sym present"
 done

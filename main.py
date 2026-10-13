@@ -278,6 +278,12 @@ DEFAULT_CONFIG = {
     "heavy_relpath": "",
     "community_presets": [],
     "community_packs": [],
+    # Games whose Steam launch options carry our per-game wrapper, keyed by
+    # app id: {"<appid>": {"name": ..., "relpath": ..., "added_command": bool}}.
+    # The wrapper outlives the game process, so it has to be tracked somewhere
+    # the plugin can still read when the game is not running — otherwise
+    # switching to Off or System-wide can never clean it up.
+    "managed_apps": {},
 }
 
 
@@ -716,6 +722,44 @@ class Plugin:
                           refreshed)
         return True
 
+    # ------------------------------------------------------------ app registry
+    async def set_managed_app(self, app_id: int, name: str, relpath: str,
+                              enabled: bool,
+                              added_command: bool = False) -> dict:
+        """Track (or untrack) a game whose launch options carry our wrapper.
+
+        Steam keeps the wrapper after the game exits, so Off / System-wide need
+        this registry to find and clean it. `added_command` records whether the
+        wrapper had to synthesize `%command%`, because removal must take that
+        placeholder back out to restore the original options exactly.
+        """
+        try:
+            key = str(int(app_id))
+        except (TypeError, ValueError):
+            return {"ok": False, "detail": "invalid app id"}
+        if key == "0":
+            return {"ok": False, "detail": "invalid app id"}
+        cfg = self._load_config()
+        managed = dict(cfg.get("managed_apps") or {})
+        if enabled:
+            managed[key] = {"name": str(name)[:80],
+                            "relpath": str(relpath)[:200],
+                            "added_command": bool(added_command)}
+        else:
+            managed.pop(key, None)
+        cfg["managed_apps"] = managed
+        self._save_config(cfg)
+        decky.logger.info("DeckyCRT: managed apps now %s",
+                          ",".join(sorted(managed)) or "(none)")
+        return {"ok": True, "detail": f"{len(managed)} game(s) tracked"}
+
+    async def clear_managed_apps(self) -> dict:
+        """Drop the whole registry (used once every wrapper is really gone)."""
+        cfg = self._load_config()
+        cfg["managed_apps"] = {}
+        self._save_config(cfg)
+        return {"ok": True, "detail": "Tracking cleared."}
+
     # ------------------------------------------------------------------ status
     async def get_status(self) -> dict:
         cfg = self._load_config()
@@ -743,6 +787,7 @@ class Plugin:
             "preset_id": cfg.get("preset_id", "aperture-grille"),
             "params": cfg.get("params", {}),
             "presets": presets,
+            "managed_apps": cfg.get("managed_apps") or {},
             "community_packs": [
                 {"id": pack["id"], "name": pack["name"],
                  "description": pack["description"],

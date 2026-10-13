@@ -6,82 +6,45 @@ import {
   PanelSection,
   PanelSectionRow,
   SliderField,
-  ToggleField,
   staticClasses,
 } from "@decky/ui";
 import { definePlugin, toaster } from "@decky/api";
 import {
+  ManagedApp,
   PresetParam,
   StatusInfo,
+  clearManagedApps,
   downloadHeavy,
   downloadPack,
   getStatus,
   installShaders,
   removePack,
   setGlobalEnabled,
+  setManagedApp,
   setParam,
   setPreset,
 } from "./api";
+import { installWrapper, removeWrapper, wrapperPath } from "./launchOptions";
+import {
+  Capabilities,
+  RunningApp,
+  capabilities,
+  log,
+  readLaunchOptions,
+  readRunningApp,
+  writeLaunchOptions,
+} from "./steam";
 
-// Matches both deckycrt/... and deckycrt-heavy/... wrapper paths.
-const WRAPPER_MARKER = "--reshade-effect deckycrt";
+type FilterMode = "off" | "app" | "system";
 
-interface RunningApp {
-  appId: number;
-  name: string;
-}
-
-// Decky plugins run inside Steam's UI, where the real SteamClient is on
-// window. Feature-detect everything: this build does NOT expose
-// SteamClient.Apps.GetAppDetails, and calling it unguarded throws inside a
-// React effect, which takes the whole panel down (the "Decky menu crashes"
-// failure). Other plugins on this box (BC250-Toolkit) guard the same way.
-function steamRoot(): any {
-  return (window as any).SteamClient;
-}
-
-function canWatchGameSessions(): boolean {
-  return (
-    typeof steamRoot()?.GameSessions?.RegisterForAppLifetimeNotifications ===
-    "function"
-  );
-}
-
-function canReadLaunchOptions(): boolean {
-  if (typeof steamRoot()?.Apps?.GetAppDetails === "function") return true;
-  return typeof (window as any).appDetailsStore?.GetAppDetails === "function";
-}
-
-// Returns null when the launch options could NOT be read. Callers must never
-// treat null as "" — writing "" would wipe the user's real launch options.
-async function readLaunchOptions(appId: number): Promise<string | null> {
-  try {
-    const apps = steamRoot()?.Apps;
-    if (typeof apps?.GetAppDetails === "function") {
-      const d = await apps.GetAppDetails(appId);
-      if (typeof d?.strLaunchOptions === "string") return d.strLaunchOptions;
-    }
-    const store = (window as any).appDetailsStore;
-    if (typeof store?.GetAppDetails === "function") {
-      if (typeof store.RequestAppDetails === "function") {
-        await store.RequestAppDetails(appId);
-      }
-      const d2 = store.GetAppDetails(appId);
-      if (typeof d2?.strLaunchOptions === "string") return d2.strLaunchOptions;
-    }
-  } catch {
-    /* fall through to null */
-  }
-  return null;
+function toast(body: string) {
+  toaster.toast({ title: "DeckyCRT", body });
 }
 
 // A rejected backend call must never surface as a raw panel error — that is
 // what the "an error occurred in DeckyCRT" banner actually is.
 function toastError(what: string, e: unknown) {
-  toaster.toast({
-    title: "DeckyCRT",
-    body: `${what} failed — see the plugin log`,
-  });
+  toast(`${what} failed — see the plugin log`);
   console.error("DeckyCRT:", what, e);
 }
 
@@ -104,23 +67,45 @@ function sliderValue(p: PresetParam, v: number | undefined): number {
   return Number.isFinite(clamped) ? clamped : p.min;
 }
 
+function shaderPathFor(status: StatusInfo, presetId?: string): string {
+  const id = presetId ?? status.preset_id;
+  return status.presets.find((p) => p.id === id)?.relpath ?? "";
+}
+
 function Content() {
   const [status, setStatus] = useState<StatusInfo | null>(null);
   const [runningApp, setRunningApp] = useState<RunningApp | null>(null);
-  const [perGameOn, setPerGameOn] = useState(false);
-  const [perGameAvailable, setPerGameAvailable] = useState(false);
+  const [caps, setCaps] = useState<Capabilities | null>(null);
+  // null = the running game's options could not be read; do not guess "off".
+  const [runningWrapper, setRunningWrapper] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const debounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
-  const refresh = async () => {
+  const refresh = async (): Promise<StatusInfo | null> => {
     try {
-      setStatus(await getStatus());
+      const s = await getStatus();
+      setStatus(s);
+      return s;
     } catch (e) {
       toastError("Status refresh", e);
+      return null;
     }
   };
 
-  // Initial load: make sure shaders are installed, watch for running games.
+  const refreshRunningWrapper = async (app: RunningApp | null) => {
+    if (!app) {
+      setRunningWrapper(null);
+      return;
+    }
+    const cur = await readLaunchOptions(app.appId);
+    const path = cur === null ? null : wrapperPath(cur);
+    setRunningWrapper(path);
+    log(
+      `running app ${app.appId} (${app.name}) launch options ` +
+        (cur === null ? "unreadable" : JSON.stringify(cur))
+    );
+  };
+
   useEffect(() => {
     (async () => {
       try {
@@ -135,105 +120,243 @@ function Content() {
       }
     })();
 
-    // Per-game mode needs APIs that not every Steam build exposes. Detect once;
-    // never call a missing method (that is what crashes the panel).
-    const canWatch = canWatchGameSessions();
-    const canRead = canReadLaunchOptions();
-    setPerGameAvailable(canWatch && canRead);
-    if (!canWatch) return;
-
-    let unregister: any = null;
-    try {
-      const register =
-        steamRoot().GameSessions.RegisterForAppLifetimeNotifications;
-      unregister = register((data: any) => {
-        // Non-Steam shortcut appids arrive as signed int32.
-        const appId = (data.unAppID as number) >>> 0;
-        if (!data.bRunning) {
-          setRunningApp(null);
-          return;
-        }
-        // Only reached when the API passed detection; keep it defensive anyway.
-        const apps = steamRoot()?.Apps;
-        if (typeof apps?.GetAppDetails === "function") {
-          Promise.resolve(apps.GetAppDetails(appId))
-            .then((d: any) =>
-              setRunningApp({
-                appId,
-                name: (d?.strDisplayName as string) ?? `App ${appId}`,
-              })
-            )
-            .catch(() => setRunningApp({ appId, name: `App ${appId}` }));
-        } else {
-          setRunningApp({ appId, name: `App ${appId}` });
-        }
-      });
-    } catch (e) {
-      toastError("Game session watch", e);
-    }
-    return () => {
-      try {
-        if (typeof unregister === "function") unregister();
-        else if (typeof unregister?.unregister === "function") {
-          unregister.unregister();
-        }
-      } catch {
-        /* the panel is unloading anyway */
-      }
+    // GameSessions.RegisterForAppLifetimeNotifications rejects with "Unknown
+    // method" on this Steam build despite existing, so poll the Router store
+    // the way the other working plugins here do. Coalesce and only update when
+    // the app actually changes.
+    setCaps(capabilities());
+    const poll = () => {
+      const app = readRunningApp();
+      setRunningApp((current) =>
+        current?.appId === app?.appId && current?.name === app?.name
+          ? current
+          : app
+      );
     };
+    poll();
+    const interval = globalThis.setInterval(poll, 1500);
+    return () => globalThis.clearInterval(interval);
   }, []);
 
-  // Sync the per-game toggle when the running app changes.
+  // Re-read the wrapper state whenever the foreground app changes.
   useEffect(() => {
-    (async () => {
-      if (!runningApp || !perGameAvailable) {
-        setPerGameOn(false);
-        return;
-      }
-      const cur = await readLaunchOptions(runningApp.appId);
-      setPerGameOn(cur !== null && cur.includes(WRAPPER_MARKER));
-    })();
-  }, [runningApp, perGameAvailable]);
+    void refreshRunningWrapper(runningApp);
+  }, [runningApp]);
 
-  const currentPreset = status?.presets.find((p) => p.id === status.preset_id);
+  if (!status) {
+    return (
+      <PanelSection title="DeckyCRT">
+        <PanelSectionRow>
+          <div>Loading…</div>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
+
+  const managed = status.managed_apps ?? {};
+  const managedEntries = Object.entries(managed);
+  const managedCount = managedEntries.length;
+  const appScoped = runningWrapper !== null || managedCount > 0;
+  // One source of truth: the live session property plus the wrappers actually
+  // saved in Steam. No separate "current mode" flag that can drift.
+  const filterMode: FilterMode = status.global_enabled
+    ? "system"
+    : appScoped
+      ? "app"
+      : "off";
+  const currentPreset = status.presets.find((p) => p.id === status.preset_id);
   const currentParams =
-    (status && currentPreset && status.params[currentPreset.id]) ?? {};
-  const presetOptions = (status?.presets ?? []).map((p) => ({
+    currentPreset && status.params[currentPreset.id]
+      ? status.params[currentPreset.id]
+      : {};
+  const presetOptions = status.presets.map((p) => ({
     data: p.id,
     label: p.name + (p.heavy ? " (heavy)" : ""),
   }));
+
+  /**
+   * Install or strip the wrapper for one game, then record it.
+   *
+   * `prior` carries the stored added_command flag: removal needs it to take
+   * back the `%command%` we synthesized, and a preset change must not clear it.
+   */
+  const applyWrapper = async (
+    appId: number,
+    name: string,
+    enable: boolean,
+    rel: string,
+    prior?: ManagedApp
+  ): Promise<boolean> => {
+    const cur = await readLaunchOptions(appId);
+    if (cur === null) {
+      log(`cannot read launch options for ${appId} (${name}) — not touching`);
+      return false;
+    }
+    if (enable) {
+      if (!rel) {
+        log("no shader path for the selected preset — cannot enable");
+        return false;
+      }
+      const res = installWrapper(cur, rel);
+      if (res.blocked === "foreign-gamescope") {
+        log(`${appId} already has a gamescope wrapper — refusing to stack`);
+        return false;
+      }
+      const tracked = prior?.added_command === true;
+      if (!res.changed) {
+        // Already wrapped with this path; just make sure it is tracked.
+        await setManagedApp(appId, name, rel, true, tracked);
+        return true;
+      }
+      const ok = await writeLaunchOptions(appId, res.options);
+      if (ok) {
+        await setManagedApp(appId, name, rel, true, res.addedCommand ?? tracked);
+      }
+      return ok;
+    }
+    const res = removeWrapper(cur, prior?.added_command === true);
+    if (!res.changed) {
+      await setManagedApp(appId, name, rel, false, false);
+      return true;
+    }
+    const ok = await writeLaunchOptions(appId, res.options);
+    if (ok) await setManagedApp(appId, name, rel, false, false);
+    return ok;
+  };
+
+  /** Strip the per-game wrapper everywhere it is known to be. */
+  const clearAppScope = async (rel: string): Promise<boolean> => {
+    const targets: Array<{ appId: number; name: string }> = [];
+    if (runningApp) targets.push(runningApp);
+    for (const [id, info] of managedEntries) {
+      const appId = Number(id);
+      if (!Number.isFinite(appId) || appId <= 0) continue;
+      if (targets.some((t) => t.appId === appId)) continue;
+      targets.push({ appId, name: info.name });
+    }
+    let ok = true;
+    for (const t of targets) {
+      if (!(await applyWrapper(t.appId, t.name, false, rel, managed[String(t.appId)]))) {
+        ok = false;
+      }
+    }
+    if (ok) await clearManagedApps();
+    return ok;
+  };
+
+  const handleModeChange = async (mode: FilterMode) => {
+    if (busy || mode === filterMode) return;
+    setBusy(true);
+    const rel = shaderPathFor(status);
+    log(`mode -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`);
+    try {
+      if (mode === "off") {
+        const cleared = await clearAppScope(rel);
+        let detail = "CRT filter off.";
+        if (status.global_enabled) {
+          const res = await setGlobalEnabled(false);
+          detail = res.ok ? "CRT filter off." : res.detail;
+        }
+        if (!cleared) {
+          detail +=
+            " Some saved per-game wrappers could not be read or cleared — see the plugin log.";
+        }
+        toast(detail);
+      } else if (mode === "system") {
+        const cleared = await clearAppScope(rel);
+        if (!cleared) {
+          toast(
+            "Couldn't clear every saved per-game wrapper, so system-wide was not enabled — they must not stack."
+          );
+          return;
+        }
+        const res = await setGlobalEnabled(true);
+        toast(res.detail);
+      } else {
+        // Active app: the wrapper lives in that game's saved launch options.
+        // It cannot filter a game that is already running.
+        if (!runningApp) {
+          toast(
+            "Start a game first — active-app mode saves the filter in that game's launch options."
+          );
+          return;
+        }
+        if (status.global_enabled) {
+          const res = await setGlobalEnabled(false);
+          if (!res.ok) {
+            toast(res.detail);
+            return;
+          }
+        }
+        const ok = await applyWrapper(
+          runningApp.appId,
+          runningApp.name,
+          true,
+          rel,
+          managed[String(runningApp.appId)]
+        );
+        toast(
+          ok
+            ? `Saved for ${runningApp.name}. It applies the next time that game starts.`
+            : `Couldn't save launch options for ${runningApp.name} — nothing changed. See the plugin log.`
+        );
+      }
+    } catch (e) {
+      toastError("Mode change", e);
+    } finally {
+      await refresh();
+      await refreshRunningWrapper(runningApp);
+      setBusy(false);
+    }
+  };
 
   const handlePreset = async (presetId: string) => {
     try {
       const res = await setPreset(presetId);
       if (!res.ok) {
-        toaster.toast({ title: "DeckyCRT", body: res.detail });
+        toast(res.detail);
         return;
       }
-      await refresh();
+      const fresh = await refresh();
+      if (!fresh) return;
+      // Saved wrappers point at a path; a preset change has to re-point them
+      // or the game keeps launching the old shader.
+      const tracked = Object.entries(fresh.managed_apps ?? {});
+      if (!tracked.length) return;
+      const rel = shaderPathFor(fresh);
+      let ok = 0;
+      for (const [id, info] of tracked) {
+        const appId = Number(id);
+        if (!Number.isFinite(appId) || appId <= 0) continue;
+        if (await applyWrapper(appId, info.name, true, rel, info)) ok++;
+      }
+      if (ok !== tracked.length) {
+        toast(
+          `Updated the saved wrapper for ${ok} of ${tracked.length} game(s) — see the plugin log.`
+        );
+      } else if (ok > 0) {
+        toast(`Saved wrapper re-pointed for ${ok} game(s).`);
+      }
     } catch (e) {
       toastError("Preset switch", e);
     }
   };
 
-  const handleGlobalToggle = async (enable: boolean) => {
+  const handleRemoveWrappers = async () => {
+    setBusy(true);
     try {
-      if (enable && perGameOn && runningApp) {
-        // Don't stack: turn the per-game wrapper off first, then go global.
-        // (The game's own gamescope would otherwise filter the same output.)
-        const cleared = await applyPerGameWrapper(false);
-        toaster.toast({
-          title: "DeckyCRT",
-          body: cleared
-            ? `Per-game CRT turned off on ${runningApp.name} — they can't stack.`
-            : "Couldn't turn per-game CRT off — check the plugin log.",
-        });
-      }
-      const res = await setGlobalEnabled(enable);
-      toaster.toast({ title: "DeckyCRT", body: res.detail });
+      const ok = await clearAppScope(shaderPathFor(status));
+      toast(
+        ok
+          ? "Per-game wrappers removed."
+          : "Some wrappers could not be cleared — see the plugin log."
+      );
       await refresh();
+      await refreshRunningWrapper(runningApp);
     } catch (e) {
-      toastError("Global toggle", e);
+      toastError("Wrapper cleanup", e);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -256,7 +379,7 @@ function Content() {
     debounceTimers.current[timerKey] = setTimeout(async () => {
       try {
         const res = await setParam(presetId, key, value, true);
-        if (!res.ok) toaster.toast({ title: "DeckyCRT", body: res.detail });
+        if (!res.ok) toast(res.detail);
       } catch (e) {
         toastError("Slider change", e);
       }
@@ -267,10 +390,7 @@ function Content() {
     setBusy(true);
     try {
       const res = await downloadHeavy();
-      toaster.toast({
-        title: "DeckyCRT",
-        body: res.ok ? `Installed: ${res.relpath}` : `Failed: ${res.detail}`,
-      });
+      toast(res.ok ? `Installed: ${res.relpath}` : `Failed: ${res.detail}`);
       await refresh();
     } catch (e) {
       toastError("Heavy shader download", e);
@@ -283,7 +403,7 @@ function Content() {
     setBusy(true);
     try {
       const res = await downloadPack(packId);
-      toaster.toast({ title: "DeckyCRT", body: res.detail });
+      toast(res.detail);
       await refresh();
     } catch (e) {
       toastError("Pack download", e);
@@ -295,110 +415,36 @@ function Content() {
   const handleRemovePack = async (packId: string) => {
     try {
       const res = await removePack(packId);
-      toaster.toast({ title: "DeckyCRT", body: res.detail });
+      toast(res.detail);
       await refresh();
     } catch (e) {
       toastError("Pack removal", e);
     }
   };
 
-  // Add or strip the per-game wrapper. One place, because both toggles need it:
-  // enabling global has to be able to turn the per-game filter off.
-  const applyPerGameWrapper = async (enable: boolean): Promise<boolean> => {
-    if (!runningApp) return false;
-    const rel =
-      status?.presets.find((p) => p.id === status?.preset_id)?.relpath ?? "";
-    if (enable && !rel) {
-      toaster.toast({
-        title: "DeckyCRT",
-        body: "Download the heavy shaders first (button above).",
-      });
-      return false;
-    }
-    const cur = await readLaunchOptions(runningApp.appId);
-    if (cur === null) {
-      // Never write on an unreadable value — it would wipe the user's options.
-      toaster.toast({
-        title: "DeckyCRT",
-        body: "Couldn't read this game's launch options — nothing changed.",
-      });
-      return false;
-    }
-    let next = cur;
-    if (enable) {
-      if (cur.includes(WRAPPER_MARKER)) return true;
-      const wrapper = `gamescope --reshade-effect ${rel} -- `;
-      next = cur ? wrapper + cur : wrapper + "%command%";
-    } else {
-      if (!cur.includes(WRAPPER_MARKER)) return true;
-      next = cur.replace(/^gamescope --reshade-effect \S+ -- /, "");
-    }
-    const setLaunchOptions = steamRoot()?.Apps?.SetAppLaunchOptions;
-    if (typeof setLaunchOptions !== "function") {
-      toaster.toast({
-        title: "DeckyCRT",
-        body: "This Steam build doesn't allow changing launch options.",
-      });
-      return false;
-    }
-    try {
-      await setLaunchOptions(runningApp.appId, next);
-      let confirmed = false;
-      for (let i = 0; i < 6; i++) {
-        await new Promise((r) => setTimeout(r, 300));
-        if ((await readLaunchOptions(runningApp.appId)) === next) {
-          confirmed = true;
-          break;
-        }
-      }
-      const after = await readLaunchOptions(runningApp.appId);
-      setPerGameOn(after !== null && after.includes(WRAPPER_MARKER));
-      if (!confirmed)
-        toaster.toast({
-          title: "DeckyCRT",
-          body: "Steam didn't confirm the launch options change.",
-        });
-      return confirmed;
-    } catch {
-      toaster.toast({ title: "DeckyCRT", body: "Failed to update launch options." });
-      return false;
-    }
-  };
+  const modeOptions = [
+    { data: "off", label: "Off" },
+    {
+      data: "app",
+      label: runningApp ? `Active app: ${runningApp.name}` : "Active app",
+    },
+    { data: "system", label: "System-wide" },
+  ];
+  const managedNames = managedEntries.map(([, info]) => info.name).join(", ");
+  const modeDescription =
+    filterMode === "system"
+      ? runningApp
+        ? `Filtering the whole screen right now, including ${runningApp.name}.`
+        : "Filtering the whole screen right now, including the Steam UI."
+      : filterMode === "app"
+        ? runningWrapper !== null && runningApp
+          ? `Saved in ${runningApp.name}'s launch options — it applies the next time that game starts, not to the copy already running.`
+          : `Saved for ${managedNames}. Applies the next time each game starts.`
+        : runningApp
+          ? `No filter. Active app saves it for ${runningApp.name}'s next launch; System-wide filters everything now.`
+          : "No filter. Start a game to use Active app, or use System-wide for the whole screen.";
 
-  const handlePerGame = async (enable: boolean) => {
-    if (!runningApp || !status) return;
-    if (!perGameAvailable) {
-      toaster.toast({
-        title: "DeckyCRT",
-        body: "This Steam build doesn't expose app launch options.",
-      });
-      return;
-    }
-    if (enable && status.global_enabled) {
-      // They can't stack: global filters the whole session while per-game wraps
-      // the game in its own gamescope, so both would filter the same output.
-      await setGlobalEnabled(false);
-      await refresh();
-      toaster.toast({
-        title: "DeckyCRT",
-        body: "Global CRT turned off — it can't stack with a per-game filter.",
-      });
-    }
-    await applyPerGameWrapper(enable);
-  };
-
-  if (!status) {
-    return (
-      <PanelSection title="DeckyCRT">
-        <PanelSectionRow>
-          <div>Loading…</div>
-        </PanelSectionRow>
-      </PanelSection>
-    );
-  }
-
-  const showHeavyDownload =
-    currentPreset?.heavy && !status.heavy_installed;
+  const showHeavyDownload = currentPreset?.heavy && !status.heavy_installed;
 
   return (
     <>
@@ -411,16 +457,17 @@ function Content() {
             </div>
           </PanelSectionRow>
         )}
-        <ToggleField
-          label="Global CRT (whole screen)"
-          description={
-            status.xprop_available
-              ? "Applies the shader to the entire Gamescope session."
-              : "Unavailable: needs xprop in this session."
+        <DropdownItem
+          label="Filter mode"
+          description={modeDescription}
+          rgOptions={modeOptions}
+          selectedOption={
+            modeOptions.find((o) => o.data === filterMode) ?? modeOptions[0]
           }
-          checked={status.global_enabled}
-          disabled={!status.xprop_available || !status.reshade_supported}
-          onChange={handleGlobalToggle}
+          disabled={busy || !status.reshade_supported}
+          onChange={(opt: { data: string }) =>
+            handleModeChange(opt.data as FilterMode)
+          }
         />
         <DropdownItem
           label="Preset"
@@ -443,44 +490,66 @@ function Content() {
             {busy ? "Downloading…" : "Download CRT-Royale (heavy)"}
           </ButtonItem>
         )}
-        {(currentPreset?.params ?? [])
-          .filter(paramIsUsable)
-          .slice(0, 12)
-          .map((param) => (
-            <SliderField
-              key={param.key}
-              label={param.label}
-              min={param.min}
-              max={param.max}
-              step={param.step}
-              value={sliderValue(param, currentParams[param.key])}
-              onChange={(v: number) =>
-                handleSlider(status.preset_id, param.key, v)
-              }
-            />
-          ))}
-        <PanelSectionRow>
-          <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
-            {status.global_enabled && perGameOn
-              ? "Both are on — the CRT is being applied twice (double blur, double cost). Turn one off."
-              : "Global and per-game can't stack: turning one on turns the other off."}
-          </div>
-        </PanelSectionRow>
+        {currentPreset?.params
+          ? currentPreset.params
+              .filter(paramIsUsable)
+              .slice(0, 12)
+              .map((param) => (
+                <SliderField
+                  key={param.key}
+                  label={param.label}
+                  min={param.min}
+                  max={param.max}
+                  step={param.step}
+                  value={sliderValue(param, currentParams[param.key])}
+                  onChange={(v: number) =>
+                    handleSlider(status.preset_id, param.key, v)
+                  }
+                />
+              ))
+          : null}
+        {filterMode === "app" && (
+          <PanelSectionRow>
+            <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
+              Slider changes rewrite the shader file; a game that is already
+              running keeps its compiled copy until it restarts.
+            </div>
+          </PanelSectionRow>
+        )}
       </PanelSection>
 
-      {runningApp && (
-        <PanelSection title="This game">
-          <ToggleField
-            label={runningApp.name}
-            description={
-              perGameAvailable
-                ? "Wrap this game's launch options in Gamescope + CRT."
-                : "Unavailable: this Steam build doesn't expose app launch options."
-            }
-            checked={perGameOn}
-            disabled={!status.reshade_supported || !perGameAvailable}
-            onChange={handlePerGame}
-          />
+      {managedCount > 0 && (
+        <PanelSection title="Saved per-game filters">
+          <PanelSectionRow>
+            <div style={{ fontSize: "0.85em", opacity: 0.85 }}>
+              {managedNames}
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
+              These games start under Gamescope with the selected preset.
+              Removing the wrappers restores each game's original launch
+              options.
+            </div>
+          </PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            disabled={busy}
+            onClick={handleRemoveWrappers}
+          >
+            {busy ? "Working…" : "Remove saved wrappers"}
+          </ButtonItem>
+        </PanelSection>
+      )}
+
+      {!caps?.canWriteLaunchOptions && (
+        <PanelSection title="Steam integration">
+          <PanelSectionRow>
+            <div>
+              This Steam build doesn't expose launch-option editing, so
+              active-app mode is unavailable. System-wide mode still works.
+            </div>
+          </PanelSectionRow>
         </PanelSection>
       )}
 
