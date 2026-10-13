@@ -67,7 +67,14 @@ pnpm run build # produces dist/index.js
 ```
 
 Then zip `plugin.json`, `package.json`, `main.py`, `dist/`, `shaders/`,
-`README.md` and `LICENSE` and install the zip via Decky's Developer menu.
+`community/`, `README.md` and `LICENSE` and install the zip via Decky's
+Developer menu.
+
+`community/ReShade.fxh` is vendored into every pack's `Shaders/` directory on
+install. Gamescope ships no ReShade headers and every community shader opens
+with `#include "ReShade.fxh"`, so without it each one fails at line 1 with
+"could not open included file" and the whole pack is dead weight. Packs already
+installed get it added on the next plugin load.
 
 ## Verifying a change
 

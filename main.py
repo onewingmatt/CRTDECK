@@ -39,6 +39,12 @@ HEAVY_ZIP_URL = (
     "/archive/refs/heads/vkbasalt.zip"
 )
 COMMUNITY_SUBDIR = "deckycrt-community"
+COMMUNITY_HEADER = "ReShade.fxh"
+# Every community shader opens with `#include "ReShade.fxh"`, and Gamescope
+# ships no ReShade headers, so without this file every one of them fails at
+# line 1 with "could not open included file". Bundled so packs install offline.
+COMMUNITY_HEADER_URL = ("https://raw.githubusercontent.com/crosire/"
+                        "reshade-shaders/master/Shaders/ReShade.fxh")
 # Bump when _parse_uniforms' range rules change: stored community params were
 # derived by the old rules and would otherwise keep poisoning the panel.
 PARAMS_REV = 2
@@ -524,6 +530,7 @@ class Plugin:
             shaders_dir = os.path.join(target_base, "Shaders")
             if not os.path.isdir(shaders_dir):
                 raise RuntimeError("no Shaders dir found in pack")
+            self._ensure_pack_header(target_base)
             added = []
             for fn in sorted(os.listdir(shaders_dir)):
                 if not fn.lower().endswith(".fx"):
@@ -584,6 +591,65 @@ class Plugin:
             pass
         decky.logger.info("DeckyCRT: pack %s removed", pack_id)
         return {"ok": True, "detail": "Pack removed."}
+
+    def _bundled_header(self) -> str | None:
+        for cand in (
+            os.path.join(self._plugin_dir, "community", COMMUNITY_HEADER),
+            os.path.join(self._plugin_dir, "shaders", COMMUNITY_HEADER),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "community", COMMUNITY_HEADER),
+        ):
+            if os.path.isfile(cand):
+                return cand
+        return None
+
+    def _ensure_pack_header(self, pack_dir: str) -> bool:
+        """Make sure a pack's Shaders dir contains ReShade.fxh.
+
+        Community shaders all `#include "ReShade.fxh"` and Gamescope provides no
+        ReShade headers, so a pack without this file compiles none of them.
+        """
+        shaders = os.path.join(pack_dir, "Shaders")
+        if not os.path.isdir(shaders):
+            return False
+        dst = os.path.join(shaders, COMMUNITY_HEADER)
+        src = self._bundled_header()
+        try:
+            if src:
+                if (not os.path.isfile(dst)
+                        or os.path.getsize(dst) != os.path.getsize(src)):
+                    shutil.copyfile(src, dst)
+                return True
+            if os.path.isfile(dst):
+                return True
+            req = urllib.request.Request(
+                COMMUNITY_HEADER_URL, headers={"User-Agent": "deckycrt/0.2"})
+            with urllib.request.urlopen(req, timeout=30,
+                                        context=_ssl_context()) as r:
+                data = r.read()
+            with open(dst, "wb") as f:
+                f.write(data)
+            return True
+        except Exception as e:  # noqa: BLE001 - a pack without it still lists
+            decky.logger.error("DeckyCRT: no %s for %s: %s",
+                               COMMUNITY_HEADER, pack_dir, e)
+            return False
+
+    async def ensure_pack_headers(self) -> int:
+        """Self-heal packs installed before the header was bundled."""
+        base = os.path.join(self._shader_base, COMMUNITY_SUBDIR)
+        fixed = 0
+        try:
+            for name in os.listdir(base):
+                pack_dir = os.path.join(base, name)
+                if os.path.isdir(pack_dir) and self._ensure_pack_header(pack_dir):
+                    fixed += 1
+        except OSError:
+            pass
+        if fixed:
+            decky.logger.info("DeckyCRT: ensured %s in %d pack(s)",
+                              COMMUNITY_HEADER, fixed)
+        return fixed
 
     async def migrate_params(self) -> bool:
         """Re-derive stored community params after a parser rule change.
@@ -886,6 +952,10 @@ class Plugin:
             await self.migrate_params()
         except Exception as e:  # noqa: BLE001
             decky.logger.error("DeckyCRT param migration failed: %s", e)
+        try:
+            await self.ensure_pack_headers()
+        except Exception as e:  # noqa: BLE001
+            decky.logger.error("DeckyCRT pack header check failed: %s", e)
 
     async def _unload(self):
         decky.logger.info("DeckyCRT backend unloaded.")
