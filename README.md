@@ -57,6 +57,18 @@ emulators, all of it.
   of crt-royale-reshade at your request (large download, may be fragile
   under VRR).
 
+## Build from source
+
+```bash
+git clone https://github.com/onewingmatt/CRTDECK
+cd CRTDECK
+pnpm install   # pnpm v9 required
+pnpm run build # produces dist/index.js
+```
+
+Then zip `plugin.json`, `package.json`, `main.py`, `dist/`, `shaders/`,
+`README.md` and `LICENSE` and install the zip via Decky's Developer menu.
+
 ## Uninstall
 
 Remove via Decky's plugin settings. Your games' launch options are left
