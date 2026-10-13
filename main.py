@@ -16,6 +16,7 @@ client API (proven pattern); the backend only supplies shader paths.
 import asyncio
 import json
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -539,7 +540,7 @@ class Plugin:
             "displays": self._x11_displays(),
             "shaders_installed": shaders_installed,
             "heavy_installed": bool(cfg.get("heavy_relpath")),
-            "global_enabled": bool(cfg.get("global_enabled")),
+            "global_enabled": self._live_global_enabled(cfg),
             "preset_id": cfg.get("preset_id", "aperture-grille"),
             "params": cfg.get("params", {}),
             "presets": presets,
@@ -574,18 +575,69 @@ class Plugin:
             pass
         return out
 
-    def _xprop_available(self) -> bool:
-        return shutil.which("xprop") is not None and bool(self._x11_displays())
+    def _display_owner(self, display: str) -> str | None:
+        """User that owns this X server's socket.
+
+        The session's X server authorises the session user by local identity
+        (SI:localuser:<user>) and there is typically no cookie file, so a
+        root-owned process must run X clients as that same user.
+        """
+        num = display.lstrip(":") or "0"
+        try:
+            return pwd.getpwuid(
+                os.stat(f"/tmp/.X11-unix/X{num}").st_uid).pw_name
+        except (OSError, KeyError):
+            return None
 
     def _xprop(self, display: str, *args: str):
         env = dict(os.environ)
         env["DISPLAY"] = display
+        cmd = ["xprop", "-root", *args]
+        # Decky's loader runs as root; the session's X server only authorises
+        # the session user, so run xprop as them (DISPLAY is set inside the
+        # command because runuser resets the environment).
+        if os.geteuid() == 0:
+            owner = self._display_owner(display)
+            if owner and owner != "root":
+                cmd = ["runuser", "-u", owner, "--", "env",
+                       f"DISPLAY={display}", *cmd]
         try:
-            p = subprocess.run(["xprop", "-root", *args], capture_output=True,
-                               text=True, timeout=10, env=env)
-            return p.returncode, p.stdout.strip()
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=10, env=env)
+            return p.returncode, (p.stdout + p.stderr).strip()
         except (OSError, subprocess.TimeoutExpired) as e:
             return 1, str(e)
+
+    def _gamescope_displays(self) -> list:
+        """Displays that really carry Gamescope's reshade property.
+
+        Other Xwayland servers in the session answer xprop but have no
+        GAMESCOPE_* properties, so writing to them silently does nothing.
+        """
+        found = []
+        for display in self._x11_displays():
+            rc, out = self._xprop(display, "-notype",
+                                  "GAMESCOPE_RESHADE_EFFECT")
+            if rc == 0 and "not found" not in out:
+                found.append(display)
+        return found
+
+    def _live_global_enabled(self, cfg: dict) -> bool:
+        """Report the session's real state, not just what we last wrote.
+
+        Gamescope resets the property to empty when the session restarts, so
+        the stored flag alone can claim CRT is on while the screen is clean.
+        """
+        for display in self._gamescope_displays():
+            rc, out = self._xprop(display, "-notype",
+                                  "GAMESCOPE_RESHADE_EFFECT")
+            if rc == 0 and ".fx" in out:
+                return True
+        return False
+
+    def _xprop_available(self) -> bool:
+        return (shutil.which("xprop") is not None
+                and bool(self._gamescope_displays()))
 
     # ------------------------------------------------------------------ apply
     async def set_preset(self, preset_id: str) -> dict:
@@ -663,10 +715,12 @@ class Plugin:
         if shutil.which("xprop") is None:
             return {"ok": False,
                     "detail": "xprop is not installed; global mode unavailable."}
-        displays = self._x11_displays()
+        displays = self._gamescope_displays()
         if not displays:
             return {"ok": False,
-                    "detail": "No X11 displays found in this session."}
+                    "detail": "No Gamescope display reachable over xprop — "
+                              "global mode needs xprop plus a Gamescope "
+                              "session."}
 
         value = relpath if enabled else ""
         last_err = ""
