@@ -96,6 +96,8 @@ const removePack = callable("remove_pack");
 const WRAPPER_MARKER = "--reshade-effect deckycrt";
 async function readLaunchOptions(appId) {
     try {
+        // @decky/ui's SteamClient types omit Apps.GetAppDetails; it exists at
+        // runtime, so cast rather than redeclaring the whole global as any.
         const details = await SteamClient.Apps.GetAppDetails(appId);
         return details?.strLaunchOptions ?? "";
     }
@@ -103,28 +105,65 @@ async function readLaunchOptions(appId) {
         return "";
     }
 }
+// A rejected backend call must never surface as a raw panel error — that is
+// what the "an error occurred in DeckyCRT" banner actually is.
+function toastError(what, e) {
+    toaster.toast({
+        title: "DeckyCRT",
+        body: `${what} failed — see the plugin log`,
+    });
+    console.error("DeckyCRT:", what, e);
+}
+// The backend derives these ranges, but the panel must not trust any of it:
+// a SliderField with a value outside [min, max] takes the whole panel down.
+function paramIsUsable(p) {
+    return (Number.isFinite(p.min) &&
+        Number.isFinite(p.max) &&
+        Number.isFinite(p.step) &&
+        p.max > p.min &&
+        p.step > 0 &&
+        p.step <= p.max - p.min);
+}
+function sliderValue(p, v) {
+    const base = typeof v === "number" && Number.isFinite(v) ? v : p.default;
+    const clamped = Math.min(Math.max(base, p.min), p.max);
+    return Number.isFinite(clamped) ? clamped : p.min;
+}
 function Content() {
     const [status, setStatus] = SP_REACT.useState(null);
     const [runningApp, setRunningApp] = SP_REACT.useState(null);
     const [perGameOn, setPerGameOn] = SP_REACT.useState(false);
     const [busy, setBusy] = SP_REACT.useState(false);
     const debounceTimers = SP_REACT.useRef({});
-    const refresh = async () => setStatus(await getStatus());
+    const refresh = async () => {
+        try {
+            setStatus(await getStatus());
+        }
+        catch (e) {
+            toastError("Status refresh", e);
+        }
+    };
     // Initial load: make sure shaders are installed, watch for running games.
     SP_REACT.useEffect(() => {
         (async () => {
-            let s = await getStatus();
-            if (!s.shaders_installed) {
-                await installShaders();
-                s = await getStatus();
+            try {
+                let s = await getStatus();
+                if (!s.shaders_installed) {
+                    await installShaders();
+                    s = await getStatus();
+                }
+                setStatus(s);
             }
-            setStatus(s);
+            catch (e) {
+                toastError("Initial load", e);
+            }
         })();
         const unregister = SteamClient.GameSessions.RegisterForAppLifetimeNotifications((data) => {
             // Non-Steam shortcut appids arrive as signed int32.
             const appId = data.unAppID >>> 0;
             if (data.bRunning) {
-                SteamClient.Apps.GetAppDetails(appId)
+                SteamClient.Apps
+                    .GetAppDetails(appId)
                     .then((d) => setRunningApp({
                     appId,
                     name: d?.strDisplayName ?? `App ${appId}`,
@@ -135,6 +174,7 @@ function Content() {
                 setRunningApp(null);
             }
         });
+        // @decky/ui types this as Unregisterable, which is not callable.
         return () => unregister();
     }, []);
     // Sync the per-game toggle when the running app changes.
@@ -154,17 +194,27 @@ function Content() {
         label: p.name + (p.heavy ? " (heavy)" : ""),
     }));
     const handlePreset = async (presetId) => {
-        const res = await setPreset(presetId);
-        if (!res.ok) {
-            toaster.toast({ title: "DeckyCRT", body: res.detail });
-            return;
+        try {
+            const res = await setPreset(presetId);
+            if (!res.ok) {
+                toaster.toast({ title: "DeckyCRT", body: res.detail });
+                return;
+            }
+            await refresh();
         }
-        await refresh();
+        catch (e) {
+            toastError("Preset switch", e);
+        }
     };
     const handleGlobalToggle = async (enable) => {
-        const res = await setGlobalEnabled(enable);
-        toaster.toast({ title: "DeckyCRT", body: res.detail });
-        await refresh();
+        try {
+            const res = await setGlobalEnabled(enable);
+            toaster.toast({ title: "DeckyCRT", body: res.detail });
+            await refresh();
+        }
+        catch (e) {
+            toastError("Global toggle", e);
+        }
     };
     const handleSlider = (presetId, key, value) => {
         // Optimistic UI update; bake into the shader file after a short pause.
@@ -181,32 +231,56 @@ function Content() {
         if (debounceTimers.current[timerKey])
             clearTimeout(debounceTimers.current[timerKey]);
         debounceTimers.current[timerKey] = setTimeout(async () => {
-            const res = await setParam(presetId, key, value, true);
-            if (!res.ok)
-                toaster.toast({ title: "DeckyCRT", body: res.detail });
+            try {
+                const res = await setParam(presetId, key, value, true);
+                if (!res.ok)
+                    toaster.toast({ title: "DeckyCRT", body: res.detail });
+            }
+            catch (e) {
+                toastError("Slider change", e);
+            }
         }, 600);
     };
     const handleDownloadHeavy = async () => {
         setBusy(true);
-        const res = await downloadHeavy();
-        setBusy(false);
-        toaster.toast({
-            title: "DeckyCRT",
-            body: res.ok ? `Installed: ${res.relpath}` : `Failed: ${res.detail}`,
-        });
-        await refresh();
+        try {
+            const res = await downloadHeavy();
+            toaster.toast({
+                title: "DeckyCRT",
+                body: res.ok ? `Installed: ${res.relpath}` : `Failed: ${res.detail}`,
+            });
+            await refresh();
+        }
+        catch (e) {
+            toastError("Heavy shader download", e);
+        }
+        finally {
+            setBusy(false);
+        }
     };
     const handleDownloadPack = async (packId) => {
         setBusy(true);
-        const res = await downloadPack(packId);
-        setBusy(false);
-        toaster.toast({ title: "DeckyCRT", body: res.detail });
-        await refresh();
+        try {
+            const res = await downloadPack(packId);
+            toaster.toast({ title: "DeckyCRT", body: res.detail });
+            await refresh();
+        }
+        catch (e) {
+            toastError("Pack download", e);
+        }
+        finally {
+            setBusy(false);
+        }
     };
     const handleRemovePack = async (packId) => {
-        const res = await removePack(packId);
-        toaster.toast({ title: "DeckyCRT", body: res.detail });
-        await refresh();
+        try {
+            const res = await removePack(packId);
+            toaster.toast({ title: "DeckyCRT", body: res.detail });
+            await refresh();
+        }
+        catch (e) {
+            toastError("Pack removal", e);
+        }
     };
     const handlePerGame = async (enable) => {
         if (!runningApp || !status)
@@ -263,7 +337,11 @@ function Content() {
     const showHeavyDownload = currentPreset?.heavy && !status.heavy_installed;
     return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { title: "CRT filter", children: [!status.reshade_supported && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "Gamescope ReShade support not detected. Shaders can't be applied on this system." }) })), SP_JSX.jsx(DFL.ToggleField, { label: "Global CRT (whole screen)", description: status.xprop_available
                             ? "Applies the shader to the entire Gamescope session."
-                            : "Unavailable: needs xprop in this session.", checked: status.global_enabled, disabled: !status.xprop_available || !status.reshade_supported, onChange: handleGlobalToggle }), SP_JSX.jsx(DFL.DropdownItem, { label: "Preset", rgOptions: presetOptions, selectedOption: presetOptions.find((o) => o.data === status.preset_id), onChange: (opt) => handlePreset(opt.data) }), currentPreset && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: currentPreset.description }) })), showHeavyDownload && (SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: handleDownloadHeavy, disabled: busy, children: busy ? "Downloading…" : "Download CRT-Royale (heavy)" })), currentPreset?.params.map((param) => (SP_JSX.jsx(DFL.SliderField, { label: param.label, min: param.min, max: param.max, step: param.step, value: currentParams[param.key] ?? param.default, onChange: (v) => handleSlider(currentPreset.id, param.key, v) }, param.key))), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "Global and per-game stack \u2014 use one or the other, not both." }) })] }), runningApp && (SP_JSX.jsx(DFL.PanelSection, { title: "This game", children: SP_JSX.jsx(DFL.ToggleField, { label: runningApp.name, description: "Wrap this game's launch options in Gamescope + CRT.", checked: perGameOn, disabled: !status.reshade_supported, onChange: handlePerGame }) })), SP_JSX.jsxs(DFL.PanelSection, { title: "Community packs", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: "Curated shader collections from the community. Experimental \u2014 some shaders may not compile on your Gamescope build. New presets appear in the list above after downloading." }) }), status.community_packs.map((pack) => (SP_JSX.jsxs("div", { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "0.9em" }, children: [SP_JSX.jsx("div", { children: pack.name }), SP_JSX.jsx("div", { style: { opacity: 0.7, fontSize: "0.9em" }, children: pack.description })] }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: () => pack.installed
+                            : "Unavailable: needs xprop in this session.", checked: status.global_enabled, disabled: !status.xprop_available || !status.reshade_supported, onChange: handleGlobalToggle }), SP_JSX.jsx(DFL.DropdownItem, { label: "Preset", rgOptions: presetOptions, selectedOption: presetOptions.find((o) => o.data === status.preset_id) ??
+                            presetOptions[0], onChange: (opt) => handlePreset(opt.data) }), currentPreset && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: currentPreset.description }) })), showHeavyDownload && (SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: handleDownloadHeavy, disabled: busy, children: busy ? "Downloading…" : "Download CRT-Royale (heavy)" })), (currentPreset?.params ?? [])
+                        .filter(paramIsUsable)
+                        .slice(0, 12)
+                        .map((param) => (SP_JSX.jsx(DFL.SliderField, { label: param.label, min: param.min, max: param.max, step: param.step, value: sliderValue(param, currentParams[param.key]), onChange: (v) => handleSlider(status.preset_id, param.key, v) }, param.key))), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "Global and per-game stack \u2014 use one or the other, not both." }) })] }), runningApp && (SP_JSX.jsx(DFL.PanelSection, { title: "This game", children: SP_JSX.jsx(DFL.ToggleField, { label: runningApp.name, description: "Wrap this game's launch options in Gamescope + CRT.", checked: perGameOn, disabled: !status.reshade_supported, onChange: handlePerGame }) })), SP_JSX.jsxs(DFL.PanelSection, { title: "Community packs", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: "Curated shader collections from the community. Experimental \u2014 some shaders may not compile on your Gamescope build. New presets appear in the list above after downloading." }) }), status.community_packs.map((pack) => (SP_JSX.jsxs("div", { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "0.9em" }, children: [SP_JSX.jsx("div", { children: pack.name }), SP_JSX.jsx("div", { style: { opacity: 0.7, fontSize: "0.9em" }, children: pack.description })] }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: () => pack.installed
                                     ? handleRemovePack(pack.id)
                                     : handleDownloadPack(pack.id), children: busy
                                     ? "Working…"

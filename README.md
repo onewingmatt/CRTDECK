@@ -69,6 +69,35 @@ pnpm run build # produces dist/index.js
 Then zip `plugin.json`, `package.json`, `main.py`, `dist/`, `shaders/`,
 `README.md` and `LICENSE` and install the zip via Decky's Developer menu.
 
+## Verifying a change
+
+Static checks (no device needed):
+
+```bash
+./scripts/verify.sh
+```
+
+That runs the Python syntax check, `tsc --noEmit` (a real gate — it must be
+silent), the frontend build, a check that the freshly built bundle contains the
+code just written, and a rebuild to confirm the bundle is byte-reproducible.
+
+The parts that cannot be checked off-device, and how to do them on the BC-250:
+
+- **Does Gamescope accept each shader?** It reports rejections in the journal,
+  never in Decky's log:
+  `journalctl --since '1 min ago' | grep gamescope_reshade`
+  Success is `Using technique: <name>` + `Compiling pass:`. Failure is
+  `Failed to parse reshade fx shader module: <path>(line, col): error Xnnnn`.
+  A `Couldn't find texture with name: V__BackBufferTex` line is benign.
+  Two traps: Gamescope only reloads the effect on a **new composited frame**
+  (an idle screen can sit for 10+ seconds, so poll rather than sleeping a
+  fixed second), and it **caches by path** (re-pointing at a path it already
+  parsed logs nothing — use a fresh filename to force a parse).
+- **Does the panel's data contract hold?** The panel takes the whole plugin
+  down if a preset hands it a slider whose `default` sits outside `[min, max]`.
+  Check the real list, not a guess: assert `min <= default <= max`, `step > 0`,
+  and the same for any stored value in `~/.config/deckycrt/config.json`.
+
 ## Uninstall
 
 Remove via Decky's plugin settings. Your games' launch options are left

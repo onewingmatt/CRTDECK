@@ -11,6 +11,7 @@ import {
 } from "@decky/ui";
 import { definePlugin, toaster } from "@decky/api";
 import {
+  PresetParam,
   StatusInfo,
   downloadHeavy,
   downloadPack,
@@ -32,11 +33,42 @@ interface RunningApp {
 
 async function readLaunchOptions(appId: number): Promise<string> {
   try {
-    const details = await SteamClient.Apps.GetAppDetails(appId);
+    // @decky/ui's SteamClient types omit Apps.GetAppDetails; it exists at
+    // runtime, so cast rather than redeclaring the whole global as any.
+    const details = await (SteamClient.Apps as any).GetAppDetails(appId);
     return (details?.strLaunchOptions as string) ?? "";
   } catch {
     return "";
   }
+}
+
+// A rejected backend call must never surface as a raw panel error — that is
+// what the "an error occurred in DeckyCRT" banner actually is.
+function toastError(what: string, e: unknown) {
+  toaster.toast({
+    title: "DeckyCRT",
+    body: `${what} failed — see the plugin log`,
+  });
+  console.error("DeckyCRT:", what, e);
+}
+
+// The backend derives these ranges, but the panel must not trust any of it:
+// a SliderField with a value outside [min, max] takes the whole panel down.
+function paramIsUsable(p: PresetParam): boolean {
+  return (
+    Number.isFinite(p.min) &&
+    Number.isFinite(p.max) &&
+    Number.isFinite(p.step) &&
+    p.max > p.min &&
+    p.step > 0 &&
+    p.step <= p.max - p.min
+  );
+}
+
+function sliderValue(p: PresetParam, v: number | undefined): number {
+  const base = typeof v === "number" && Number.isFinite(v) ? v : p.default;
+  const clamped = Math.min(Math.max(base, p.min), p.max);
+  return Number.isFinite(clamped) ? clamped : p.min;
 }
 
 function Content() {
@@ -46,17 +78,27 @@ function Content() {
   const [busy, setBusy] = useState(false);
   const debounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
-  const refresh = async () => setStatus(await getStatus());
+  const refresh = async () => {
+    try {
+      setStatus(await getStatus());
+    } catch (e) {
+      toastError("Status refresh", e);
+    }
+  };
 
   // Initial load: make sure shaders are installed, watch for running games.
   useEffect(() => {
     (async () => {
-      let s = await getStatus();
-      if (!s.shaders_installed) {
-        await installShaders();
-        s = await getStatus();
+      try {
+        let s = await getStatus();
+        if (!s.shaders_installed) {
+          await installShaders();
+          s = await getStatus();
+        }
+        setStatus(s);
+      } catch (e) {
+        toastError("Initial load", e);
       }
-      setStatus(s);
     })();
 
     const unregister =
@@ -65,7 +107,8 @@ function Content() {
           // Non-Steam shortcut appids arrive as signed int32.
           const appId = (data.unAppID as number) >>> 0;
           if (data.bRunning) {
-            SteamClient.Apps.GetAppDetails(appId)
+            (SteamClient.Apps as any)
+              .GetAppDetails(appId)
               .then((d: any) =>
                 setRunningApp({
                   appId,
@@ -78,7 +121,8 @@ function Content() {
           }
         }
       );
-    return () => unregister();
+    // @decky/ui types this as Unregisterable, which is not callable.
+    return () => (unregister as unknown as () => void)();
   }, []);
 
   // Sync the per-game toggle when the running app changes.
@@ -101,18 +145,26 @@ function Content() {
   }));
 
   const handlePreset = async (presetId: string) => {
-    const res = await setPreset(presetId);
-    if (!res.ok) {
-      toaster.toast({ title: "DeckyCRT", body: res.detail });
-      return;
+    try {
+      const res = await setPreset(presetId);
+      if (!res.ok) {
+        toaster.toast({ title: "DeckyCRT", body: res.detail });
+        return;
+      }
+      await refresh();
+    } catch (e) {
+      toastError("Preset switch", e);
     }
-    await refresh();
   };
 
   const handleGlobalToggle = async (enable: boolean) => {
-    const res = await setGlobalEnabled(enable);
-    toaster.toast({ title: "DeckyCRT", body: res.detail });
-    await refresh();
+    try {
+      const res = await setGlobalEnabled(enable);
+      toaster.toast({ title: "DeckyCRT", body: res.detail });
+      await refresh();
+    } catch (e) {
+      toastError("Global toggle", e);
+    }
   };
 
   const handleSlider = (presetId: string, key: string, value: number) => {
@@ -132,34 +184,52 @@ function Content() {
     if (debounceTimers.current[timerKey])
       clearTimeout(debounceTimers.current[timerKey]);
     debounceTimers.current[timerKey] = setTimeout(async () => {
-      const res = await setParam(presetId, key, value, true);
-      if (!res.ok) toaster.toast({ title: "DeckyCRT", body: res.detail });
+      try {
+        const res = await setParam(presetId, key, value, true);
+        if (!res.ok) toaster.toast({ title: "DeckyCRT", body: res.detail });
+      } catch (e) {
+        toastError("Slider change", e);
+      }
     }, 600);
   };
 
   const handleDownloadHeavy = async () => {
     setBusy(true);
-    const res = await downloadHeavy();
-    setBusy(false);
-    toaster.toast({
-      title: "DeckyCRT",
-      body: res.ok ? `Installed: ${res.relpath}` : `Failed: ${res.detail}`,
-    });
-    await refresh();
+    try {
+      const res = await downloadHeavy();
+      toaster.toast({
+        title: "DeckyCRT",
+        body: res.ok ? `Installed: ${res.relpath}` : `Failed: ${res.detail}`,
+      });
+      await refresh();
+    } catch (e) {
+      toastError("Heavy shader download", e);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleDownloadPack = async (packId: string) => {
     setBusy(true);
-    const res = await downloadPack(packId);
-    setBusy(false);
-    toaster.toast({ title: "DeckyCRT", body: res.detail });
-    await refresh();
+    try {
+      const res = await downloadPack(packId);
+      toaster.toast({ title: "DeckyCRT", body: res.detail });
+      await refresh();
+    } catch (e) {
+      toastError("Pack download", e);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleRemovePack = async (packId: string) => {
-    const res = await removePack(packId);
-    toaster.toast({ title: "DeckyCRT", body: res.detail });
-    await refresh();
+    try {
+      const res = await removePack(packId);
+      toaster.toast({ title: "DeckyCRT", body: res.detail });
+      await refresh();
+    } catch (e) {
+      toastError("Pack removal", e);
+    }
   };
 
   const handlePerGame = async (enable: boolean) => {
@@ -248,7 +318,10 @@ function Content() {
         <DropdownItem
           label="Preset"
           rgOptions={presetOptions}
-          selectedOption={presetOptions.find((o) => o.data === status.preset_id)}
+          selectedOption={
+            presetOptions.find((o) => o.data === status.preset_id) ??
+            presetOptions[0]
+          }
           onChange={(opt: { data: string }) => handlePreset(opt.data)}
         />
         {currentPreset && (
@@ -263,17 +336,22 @@ function Content() {
             {busy ? "Downloading…" : "Download CRT-Royale (heavy)"}
           </ButtonItem>
         )}
-        {currentPreset?.params.map((param) => (
-          <SliderField
-            key={param.key}
-            label={param.label}
-            min={param.min}
-            max={param.max}
-            step={param.step}
-            value={currentParams[param.key] ?? param.default}
-            onChange={(v: number) => handleSlider(currentPreset.id, param.key, v)}
-          />
-        ))}
+        {(currentPreset?.params ?? [])
+          .filter(paramIsUsable)
+          .slice(0, 12)
+          .map((param) => (
+            <SliderField
+              key={param.key}
+              label={param.label}
+              min={param.min}
+              max={param.max}
+              step={param.step}
+              value={sliderValue(param, currentParams[param.key])}
+              onChange={(v: number) =>
+                handleSlider(status.preset_id, param.key, v)
+              }
+            />
+          ))}
         <PanelSectionRow>
           <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
             Global and per-game stack — use one or the other, not both.

@@ -15,6 +15,7 @@ client API (proven pattern); the backend only supplies shader paths.
 
 import asyncio
 import json
+import math
 import os
 import pwd
 import re
@@ -38,6 +39,9 @@ HEAVY_ZIP_URL = (
     "/archive/refs/heads/vkbasalt.zip"
 )
 COMMUNITY_SUBDIR = "deckycrt-community"
+# Bump when _parse_uniforms' range rules change: stored community params were
+# derived by the old rules and would otherwise keep poisoning the panel.
+PARAMS_REV = 2
 COMMUNITY_PACKS = [
     {
         "id": "rsretroarch",
@@ -354,6 +358,11 @@ class Plugin:
 
             target = os.path.join(self._shader_base, HEAVY_SUBDIR)
             shutil.rmtree(target, ignore_errors=True)
+            if os.path.exists(target):
+                raise RuntimeError(
+                    f"{target} exists and is not writable by "
+                    f"{pwd.getpwuid(os.geteuid()).pw_name} — remove that "
+                    "directory and retry")
             shutil.copytree(src_root, target)
 
             # Discover the main .fx: prefer a *royale*.fx, shallowest first.
@@ -399,6 +408,13 @@ class Plugin:
     def _parse_uniforms(self, text: str, limit: int = 10) -> list:
         """Extract tunable float uniforms from a ReShade .fx file.
 
+        The range matters as much as the value: every parameter is rendered as
+        a slider, and a default sitting outside its own [min, max] is not
+        representable — Steam's SliderField throws on it and the whole panel
+        goes down. Community shaders rarely carry ui_min/ui_max annotations and
+        their defaults are often magnitudes (320, 240), so a missing range is
+        derived from the default instead of defaulting to 0..1.
+
         Skips gamescope built-ins (source = ...) and hidden uniforms.
         """
         params = []
@@ -418,15 +434,32 @@ class Plugin:
                 dflt = float(default)
             except ValueError:
                 continue
-            ui_min = self._ann_float(ann, "ui_min", 0.0)
-            ui_max = self._ann_float(ann, "ui_max", 1.0)
-            if ui_max <= ui_min:
-                ui_min, ui_max = 0.0, 1.0
+            if not math.isfinite(dflt):
+                continue
+
+            if ("ui_min" in ann) or ("ui_max" in ann):
+                lo = self._ann_float(ann, "ui_min", 0.0)
+                hi = self._ann_float(ann, "ui_max", 1.0)
+            elif dflt == 0.0:
+                lo, hi = 0.0, 1.0
+            elif dflt > 0.0:
+                lo, hi = 0.0, dflt * 2.0
+            else:
+                lo, hi = dflt * 2.0, 0.0
+
+            # The declared default must always be reachable.
+            lo, hi = min(lo, dflt), max(hi, dflt)
+            if not (math.isfinite(lo) and math.isfinite(hi) and hi > lo):
+                lo, hi = min(0.0, dflt), max(1.0, dflt)
+
+            span = hi - lo
+            step = self._ann_float(ann, "ui_step", 0.0)
+            if not (math.isfinite(step) and 0.0 < step <= span):
+                # 100 positions feels continuous without being unusable.
+                step = round(span / 100.0, 6) or span / 100.0
             label = self._ann_str(ann, "ui_label") or self._prettify(key)
-            span = ui_max - ui_min
-            step = round(span / 20.0, 4) or 0.01
-            params.append({"key": key, "label": label, "min": ui_min,
-                           "max": ui_max, "step": step, "default": dflt})
+            params.append({"key": key, "label": label, "min": round(lo, 6),
+                           "max": round(hi, 6), "step": step, "default": dflt})
             if len(params) >= limit:
                 break
         return params
@@ -476,6 +509,11 @@ class Plugin:
             target_base = os.path.join(self._shader_base, COMMUNITY_SUBDIR,
                                        pack["id"])
             shutil.rmtree(target_base, ignore_errors=True)
+            if os.path.exists(target_base):
+                raise RuntimeError(
+                    f"{target_base} exists and is not writable by "
+                    f"{pwd.getpwuid(os.geteuid()).pw_name} — remove that "
+                    "directory and retry")
             os.makedirs(target_base, exist_ok=True)
             # Preserve the repo's Shaders/Textures sibling layout.
             for name in ("Shaders", "Textures"):
@@ -539,8 +577,59 @@ class Plugin:
         shutil.rmtree(os.path.join(self._shader_base, COMMUNITY_SUBDIR,
                                    pack_id),
                       ignore_errors=True)
+        try:
+            # Leave no empty parent behind once the last pack is gone.
+            os.rmdir(os.path.join(self._shader_base, COMMUNITY_SUBDIR))
+        except OSError:
+            pass
         decky.logger.info("DeckyCRT: pack %s removed", pack_id)
         return {"ok": True, "detail": "Pack removed."}
+
+    async def migrate_params(self) -> bool:
+        """Re-derive stored community params after a parser rule change.
+
+        Stored params carry the slider ranges that were computed when the pack
+        was downloaded. A pack installed under older rules keeps handing the
+        panel ranges its own defaults don't fit — which takes the panel down on
+        preset switch. User-tuned values are kept, clamped into the new range.
+        """
+        cfg = self._load_config()
+        if cfg.get("params_rev") == PARAMS_REV:
+            return False
+        refreshed = 0
+        for cp in cfg.get("community_presets", []):
+            relpath = cp.get("relpath") or cp.get("file")
+            if not relpath:
+                continue
+            path = os.path.join(self._shader_base, relpath)
+            try:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            params = self._parse_uniforms(text)
+            if not params:
+                continue
+            stored = cfg.setdefault("params", {}).setdefault(cp["id"], {})
+            merged = {}
+            for spec in params:
+                v = stored.get(spec["key"], spec["default"])
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    v = spec["default"]
+                if not math.isfinite(v):
+                    v = spec["default"]
+                merged[spec["key"]] = min(max(v, spec["min"]), spec["max"])
+            cfg["params"][cp["id"]] = merged
+            if cp.get("params") != params:
+                cp["params"] = params
+                refreshed += 1
+        cfg["params_rev"] = PARAMS_REV
+        self._save_config(cfg)
+        decky.logger.info("DeckyCRT: re-derived params for %d community shaders",
+                          refreshed)
+        return True
 
     # ------------------------------------------------------------------ status
     async def get_status(self) -> dict:
@@ -690,6 +779,21 @@ class Plugin:
             return {"ok": False, "detail": "preset has no tunable params"}
         if key not in {p["key"] for p in preset.get("params", [])}:
             return {"ok": False, "detail": f"param {key} not found"}
+        # Validate before touching the file: a NaN or an out-of-range value
+        # must never be baked into a shader.
+        spec = next((p for p in preset.get("params", []) if p["key"] == key),
+                    None)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return {"ok": False, "detail": f"invalid value for {key}"}
+        if not math.isfinite(value):
+            return {"ok": False, "detail": f"invalid value for {key}"}
+        if spec:
+            lo, hi = spec.get("min"), spec.get("max")
+            if (isinstance(lo, (int, float)) and isinstance(hi, (int, float))
+                    and hi > lo):
+                value = min(max(value, lo), hi)
         if preset.get("community"):
             # Community shaders are baked in place (no pristine template).
             template = target = os.path.join(self._shader_base,
@@ -778,6 +882,10 @@ class Plugin:
                 await self.install_shaders()
         except Exception as e:  # noqa: BLE001 - must not break plugin load
             decky.logger.error("DeckyCRT auto-install failed: %s", e)
+        try:
+            await self.migrate_params()
+        except Exception as e:  # noqa: BLE001
+            decky.logger.error("DeckyCRT param migration failed: %s", e)
 
     async def _unload(self):
         decky.logger.info("DeckyCRT backend unloaded.")
