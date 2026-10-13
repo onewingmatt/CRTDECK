@@ -30,11 +30,12 @@ emulators, all of it.
   It wraps that game's Steam launch options in a nested Gamescope with the
   shader: `gamescope --reshade-effect <preset> -- <your options>`.
   Your original launch options are preserved and restored on disable.
-- **Presets** (14 built in): Scanlines, Aperture grille, Slot mask + curve,
+- **Presets** (15 built in): Scanlines, Aperture grille, Slot mask + curve,
   Slot mask (flat), Shadow mask, Green phosphor, Amber phosphor, B&W TV,
-  Composite, Consumer TV, PVM, Arcade, Lottes (all light, single-pass, with
-  live sliders), plus CRT-Royale (heavy, multi-pass — downloaded on demand,
-  experimental).
+  Composite, Consumer TV, PVM, Arcade, Lottes, **CRT Pro** (all light,
+  single-pass, with live sliders except CRT Pro, which is a bundled two-pass
+  aperture grille — halation pass plus beam profile, mask and curvature),
+  plus CRT-Royale (heavy, multi-pass — downloaded on demand, experimental).
 - **Community packs**: one-tap downloads of curated ReShade shader
   collections (RSRetroArch: Hyllian, Lottes, Geom, Caligari…; CRT-Guest
   ReShade). Downloaded shaders appear in the preset list with auto-detected

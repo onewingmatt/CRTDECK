@@ -240,6 +240,24 @@ PRESETS = [
         ],
     },
     {
+        "id": "crt-pro",
+        "name": "CRT Pro",
+        "description": ("Two-pass aperture grille: a blurred halation pass, "
+                        "then beam profile, triad mask and curvature."),
+        "file": LIGHT_SUBDIR + "/crt-pro.fx",
+        "heavy": False,
+        "params": [
+            _param("ScanIntensity", "Scanline intensity", 0.45),
+            _param("MaskStrength", "Grille strength", 0.45),
+            _param("GlowAmount", "Glow", 0.35),
+            _param("Curvature", "Screen curvature", 0.12, maxv=0.30,
+                   step=0.01),
+            _param("BeamWidth", "Beam width", 0.35, minv=0.05, maxv=0.90,
+                   step=0.01),
+            _param("Vignette", "Vignette", 0.25),
+        ],
+    },
+    {
         "id": "crt-royale",
         "name": "CRT-Royale (heavy)",
         "description": "Full multi-pass CRT-Royale port. Experimental, needs a strong GPU.",
