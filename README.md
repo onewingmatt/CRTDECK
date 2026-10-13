@@ -17,30 +17,45 @@ emulators, all of it.
 3. Open the DeckyCRT panel from the QAM. It auto-installs its shaders on
    first load.
 
-## Usage
+## Current test build
 
-- **Global CRT (whole screen)**: one toggle. It sets the shader on the
-  running Gamescope session, so every game *and* the Steam UI get the CRT
-  look. No reboot needed; toggling back off restores the clean image.
-  - Requires `xprop` and an X11 display in the session. The panel reports
-    honestly if global mode isn't available on your setup.
-  - Tip: if you use global mode, turn off any per-game CRT to avoid
-    stacking two filters.
-- **This game**: with a game running, the panel shows a per-game toggle.
-  It wraps that game's Steam launch options in a nested Gamescope with the
-  shader: `gamescope --reshade-effect <preset> -- <your options>`.
-  Your original launch options are preserved and restored on disable.
+This is an in-progress build for hands-on testing, not a production-ready
+release. The local source checkout, GitHub `main`, and the copy currently
+installed on the BC-250 may not be identical. Confirm which build is installed
+before reporting results.
+
+The current QAM interface offers one **Filter mode** selector:
+
+- **Off** disables the system-wide filter and removes DeckyCRT's wrapper from
+  the active game's Steam launch options.
+- **Active app** adds a nested Gamescope/ReShade wrapper to the foreground
+  game's launch options: `gamescope --reshade-effect <shader-path> -- ...`.
+  This changes saved launch options; it may require restarting the game and is
+  still being tested across app changes and panel reloads.
+- **System-wide** applies the filter to the entire Gamescope session, including
+  Steam. It requires `xprop` and an accessible Gamescope display.
+
+The two filter paths should not stack. Active-app detection and cleanup of
+wrappers saved for apps that are no longer running still need testing. Preset
+and slider values are saved, but a running per-game Gamescope instance may keep
+using its already-loaded shader until the game restarts. Treat that behavior as
+unverified until confirmed on the BC-250.
+
+The proposed Low / Medium / High resource categories are not in the UI yet.
+All bundled filters except CRT Pro are single-pass; CRT Pro is a two-pass
+blur-plus-CRT effect. Community shaders and CRT-Royale have not been benchmarked
+on the BC-250, so no FPS or resource-cost guarantee is implied.
+
+## Usage notes
+
 - **Presets** (15 built in): Scanlines, Aperture grille, Slot mask + curve,
   Slot mask (flat), Shadow mask, Green phosphor, Amber phosphor, B&W TV,
-  Composite, Consumer TV, PVM, Arcade, Lottes, **CRT Pro** (all light,
-  single-pass, with live sliders except CRT Pro, which is a bundled two-pass
-  aperture grille — halation pass plus beam profile, mask and curvature),
-  plus CRT-Royale (heavy, multi-pass — downloaded on demand, experimental).
-- **Community packs**: one-tap downloads of curated ReShade shader
-  collections (RSRetroArch: Hyllian, Lottes, Geom, Caligari…; CRT-Guest
-  ReShade). Downloaded shaders appear in the preset list with auto-detected
-  sliders. Experimental — not every shader compiles on every Gamescope
-  build.
+  Composite, Consumer TV, PVM, Arcade, Lottes, **CRT Pro** (bundled two-pass
+  aperture grille with halation, beam profile, mask and curvature), and
+  **CRT-Royale** (heavy, multi-pass; downloaded on demand, experimental).
+- **Community packs**: one-tap downloads of curated ReShade shader collections
+  (RSRetroArch and CRT-Guest). They are experimental and may not compile on
+  every Gamescope build.
 
 ## Requirements / notes
 
@@ -48,8 +63,8 @@ emulators, all of it.
   (`gamescope --help | grep -i reshade`). The panel shows the detected
   status. If it's missing, per-game/global modes can't work — vkBasalt
   (`ENABLE_VKBASALT=1`, Vulkan games only) is the fallback path.
-- Global mode needs `xprop`. If it's absent on your Bazzite image, only
-  per-game mode is offered.
+- System-wide mode needs `xprop` and a reachable Gamescope display. Active-app
+  mode depends on Steam exposing foreground-app and launch-option APIs.
 - Shaders live in `~/.local/share/gamescope/reshade/Shaders/deckycrt/`;
   config in `~/.config/deckycrt/config.json`. Nothing touches the
   read-only system image.
@@ -118,7 +133,9 @@ The parts that cannot be checked off-device, and how to do them on the BC-250:
 
 ## Uninstall
 
-Remove via Decky's plugin settings. Your games' launch options are left
-untouched except DeckyCRT's own wrapper, which the per-game toggle removes
-when disabled. Delete `~/.local/share/gamescope/reshade/Shaders/deckycrt*`
-and `~/.config/deckycrt` to fully clean up.
+Remove via Decky's plugin settings. Before uninstalling, set Filter mode to
+**Off** while each wrapped game is available, then verify its Steam launch
+options no longer include DeckyCRT's wrapper. Cleanup of wrappers for apps that
+are no longer discoverable is not yet guaranteed. Delete
+`~/.local/share/gamescope/reshade/Shaders/deckycrt*` and
+`~/.config/deckycrt` to fully clean up.
