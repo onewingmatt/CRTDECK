@@ -218,6 +218,17 @@ function Content() {
 
   const handleGlobalToggle = async (enable: boolean) => {
     try {
+      if (enable && perGameOn && runningApp) {
+        // Don't stack: turn the per-game wrapper off first, then go global.
+        // (The game's own gamescope would otherwise filter the same output.)
+        const cleared = await applyPerGameWrapper(false);
+        toaster.toast({
+          title: "DeckyCRT",
+          body: cleared
+            ? `Per-game CRT turned off on ${runningApp.name} — they can't stack.`
+            : "Couldn't turn per-game CRT off — check the plugin log.",
+        });
+      }
       const res = await setGlobalEnabled(enable);
       toaster.toast({ title: "DeckyCRT", body: res.detail });
       await refresh();
@@ -291,23 +302,18 @@ function Content() {
     }
   };
 
-  const handlePerGame = async (enable: boolean) => {
-    if (!runningApp || !status) return;
-    if (!perGameAvailable) {
-      toaster.toast({
-        title: "DeckyCRT",
-        body: "This Steam build doesn't expose app launch options.",
-      });
-      return;
-    }
+  // Add or strip the per-game wrapper. One place, because both toggles need it:
+  // enabling global has to be able to turn the per-game filter off.
+  const applyPerGameWrapper = async (enable: boolean): Promise<boolean> => {
+    if (!runningApp) return false;
     const rel =
-      status.presets.find((p) => p.id === status.preset_id)?.relpath ?? "";
+      status?.presets.find((p) => p.id === status?.preset_id)?.relpath ?? "";
     if (enable && !rel) {
       toaster.toast({
         title: "DeckyCRT",
         body: "Download the heavy shaders first (button above).",
       });
-      return;
+      return false;
     }
     const cur = await readLaunchOptions(runningApp.appId);
     if (cur === null) {
@@ -316,21 +322,15 @@ function Content() {
         title: "DeckyCRT",
         body: "Couldn't read this game's launch options — nothing changed.",
       });
-      return;
+      return false;
     }
     let next = cur;
     if (enable) {
-      if (cur.includes(WRAPPER_MARKER)) {
-        setPerGameOn(true);
-        return;
-      }
+      if (cur.includes(WRAPPER_MARKER)) return true;
       const wrapper = `gamescope --reshade-effect ${rel} -- `;
       next = cur ? wrapper + cur : wrapper + "%command%";
     } else {
-      if (!cur.includes(WRAPPER_MARKER)) {
-        setPerGameOn(false);
-        return;
-      }
+      if (!cur.includes(WRAPPER_MARKER)) return true;
       next = cur.replace(/^gamescope --reshade-effect \S+ -- /, "");
     }
     const setLaunchOptions = steamRoot()?.Apps?.SetAppLaunchOptions;
@@ -339,7 +339,7 @@ function Content() {
         title: "DeckyCRT",
         body: "This Steam build doesn't allow changing launch options.",
       });
-      return;
+      return false;
     }
     try {
       await setLaunchOptions(runningApp.appId, next);
@@ -358,9 +358,33 @@ function Content() {
           title: "DeckyCRT",
           body: "Steam didn't confirm the launch options change.",
         });
+      return confirmed;
     } catch {
       toaster.toast({ title: "DeckyCRT", body: "Failed to update launch options." });
+      return false;
     }
+  };
+
+  const handlePerGame = async (enable: boolean) => {
+    if (!runningApp || !status) return;
+    if (!perGameAvailable) {
+      toaster.toast({
+        title: "DeckyCRT",
+        body: "This Steam build doesn't expose app launch options.",
+      });
+      return;
+    }
+    if (enable && status.global_enabled) {
+      // They can't stack: global filters the whole session while per-game wraps
+      // the game in its own gamescope, so both would filter the same output.
+      await setGlobalEnabled(false);
+      await refresh();
+      toaster.toast({
+        title: "DeckyCRT",
+        body: "Global CRT turned off — it can't stack with a per-game filter.",
+      });
+    }
+    await applyPerGameWrapper(enable);
   };
 
   if (!status) {
@@ -437,7 +461,9 @@ function Content() {
           ))}
         <PanelSectionRow>
           <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
-            Global and per-game stack — use one or the other, not both.
+            {status.global_enabled && perGameOn
+              ? "Both are on — the CRT is being applied twice (double blur, double cost). Turn one off."
+              : "Global and per-game can't stack: turning one on turns the other off."}
           </div>
         </PanelSectionRow>
       </PanelSection>
