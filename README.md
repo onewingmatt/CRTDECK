@@ -24,22 +24,36 @@ release. The local source checkout, GitHub `main`, and the copy currently
 installed on the BC-250 may not be identical. Confirm which build is installed
 before reporting results.
 
-The current QAM interface offers one **Filter mode** selector:
+The QAM interface offers one **Filter mode** selector, and the mode it shows is
+derived from live state rather than from a separate flag:
 
-- **Off** disables the system-wide filter and removes DeckyCRT's wrapper from
-  the active game's Steam launch options.
-- **Active app** adds a nested Gamescope/ReShade wrapper to the foreground
-  game's launch options: `gamescope --reshade-effect <shader-path> -- ...`.
-  This changes saved launch options; it may require restarting the game and is
-  still being tested across app changes and panel reloads.
+- **Off** clears the whole-screen effect and removes DeckyCRT's wrapper from
+  every game it knows about, running or not.
+- **Active app** saves a Gamescope/ReShade wrapper in the foreground game's
+  Steam launch options:
+  `gamescope --reshade-effect <shader> -- %command%`. **It cannot filter a game
+  that is already running** — the wrapper only takes effect at launch, so the
+  panel says "applies the next time that game starts" instead of implying the
+  running copy changed.
 - **System-wide** applies the filter to the entire Gamescope session, including
-  Steam. It requires `xprop` and an accessible Gamescope display.
+  Steam. That necessarily includes whatever game is in the foreground; that is
+  the point of the mode, not evidence that active-app mode worked.
 
-The two filter paths should not stack. Active-app detection and cleanup of
-wrappers saved for apps that are no longer running still need testing. Preset
-and slider values are saved, but a running per-game Gamescope instance may keep
-using its already-loaded shader until the game restarts. Treat that behavior as
-unverified until confirmed on the BC-250.
+The two mechanisms must not stack, so switching between them clears the other
+first and refuses the switch if the clear cannot be verified.
+
+Wrapped games are recorded in the plugin config (`managed_apps`), because Steam
+keeps the wrapper after the game exits — without that registry, Off and
+System-wide could only ever clean up the app that happened to be in the
+foreground. Changing preset re-points every tracked wrapper.
+
+Launch options are read through `SteamClient.Apps.RegisterForAppDetails` and
+written through `SteamClient.Apps.SetAppLaunchOptions`, with the write confirmed
+by reading the value back. A read that fails returns "unknown" and nothing is
+written — writing our wrapper on top of an unread value would erase the user's
+real options. Beside it, the panel reports what it actually did in Steam's CEF
+console (`DeckyCRT: …` lines), which is where a mode change that "does nothing"
+leaves its evidence.
 
 The proposed Low / Medium / High resource categories are not in the UI yet.
 All bundled filters except CRT Pro are single-pass; CRT Pro is a two-pass
@@ -100,12 +114,26 @@ Static checks (no device needed):
 ./scripts/verify.sh
 ```
 
-That runs the Python syntax check, `tsc --noEmit` (a real gate — it must be
-silent), the frontend build, a check that the freshly built bundle contains the
-code just written, and a rebuild to confirm the bundle is byte-reproducible.
+That runs the Python syntax check, the launch-option unit tests
+(`scripts/test-launch-options.ts`, plain `node` — the types are stripped by the
+runtime), the backend harness (`scripts/test-backend.py`, which drives the real
+`main.py` against a stubbed `decky` module and a throwaway home, including the
+slider contract over the whole preset list), `tsc --noEmit` (a real gate — it
+must be silent), the frontend build, a check that the freshly built bundle
+contains the code just written, and a rebuild to confirm the bundle is
+byte-reproducible.
 
 The parts that cannot be checked off-device, and how to do them on the BC-250:
 
+- **Does the panel's mode actually write launch options?** The panel logs every
+  step to Steam's CEF console, so the answer is a grep, not a guess:
+  `grep -a DeckyCRT ~/.steam/steam/logs/cef_log.txt | tail -20`.
+  A successful "Active app" switch reads
+  `DeckyCRT: launch options for 1337520 now "gamescope --reshade-effect … %command%"`.
+  A failure says which seam it was on: `cannot read launch options`,
+  `SetAppLaunchOptions unavailable`, or
+  `Steam did not confirm launch options … read "…"` with both strings. Errors
+  only appear while the panel is mounted, so reproduce by opening it.
 - **Does Gamescope accept each shader?** It reports rejections in the journal,
   never in Decky's log:
   `journalctl --since '1 min ago' | grep gamescope_reshade`
@@ -128,14 +156,20 @@ The parts that cannot be checked off-device, and how to do them on the BC-250:
   rejected.
 - **Does the panel's data contract hold?** The panel takes the whole plugin
   down if a preset hands it a slider whose `default` sits outside `[min, max]`.
-  Check the real list, not a guess: assert `min <= default <= max`, `step > 0`,
-  and the same for any stored value in `~/.config/deckycrt/config.json`.
+  `scripts/test-backend.py` asserts that over the real list; the device-side
+  version is the same check against `~/.config/deckycrt/config.json`, whose
+  stored values are re-clamped by the backend on load.
+- **Round-trip on a real game:** wrap a game, confirm the exact launch-options
+  string in `~/.steam/steam/userdata/<id>/config/localconfig.vdf`, then set
+  Filter mode to Off and confirm the original string is back — including the
+  `%command%` the wrapper had to add for a game whose options had none.
 
 ## Uninstall
 
 Remove via Decky's plugin settings. Before uninstalling, set Filter mode to
-**Off** while each wrapped game is available, then verify its Steam launch
-options no longer include DeckyCRT's wrapper. Cleanup of wrappers for apps that
-are no longer discoverable is not yet guaranteed. Delete
-`~/.local/share/gamescope/reshade/Shaders/deckycrt*` and
-`~/.config/deckycrt` to fully clean up.
+**Off**: that clears the whole-screen effect and strips the wrapper from every
+game in the plugin's `managed_apps` registry, whether or not it is running. If
+the panel reports that some wrappers could not be read or cleared, fix those
+first — the game's launch options are the only copy. Then delete
+`~/.local/share/gamescope/reshade/Shaders/deckycrt*` and `~/.config/deckycrt`
+to fully clean up.
