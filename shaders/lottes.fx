@@ -34,11 +34,11 @@ float4 LottesPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_
     color *= 1.0 - ScanIntensity * band;
 
     float col = floor(uv.x * BUFFER_WIDTH);
-    float m = fmod(col, 3.0);
+    float m = (frac(col / 3.0) * 3.0);
     float3 triad = (m < 1.0) ? float3(1.00, 0.45, 0.45)
                  : ((m < 2.0) ? float3(0.45, 1.00, 0.45)
                               : float3(0.45, 0.45, 1.00));
-    color *= lerp(float3(1.0), triad * (1.0 / 0.6333), MaskStrength);
+    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / 0.6333), MaskStrength);
 
     color *= corner;
     color *= 1.0 + ScanIntensity * 0.30;

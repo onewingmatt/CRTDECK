@@ -26,7 +26,7 @@ float4 AmberPhosphorPS(float4 position : SV_Position, float2 texcoord : TEXCOORD
 
     // Faint vertical grille lines.
     float col = floor(texcoord.x * BUFFER_WIDTH);
-    color *= 1.0 - 0.10 * step(1.0, fmod(col, 2.0));
+    color *= 1.0 - 0.10 * step(1.0, (frac(col / 2.0) * 2.0));
 
     float phase = frac(texcoord.y * BUFFER_HEIGHT * 0.5);
     float band = smoothstep(0.0, 0.35, phase) * (1.0 - smoothstep(0.65, 1.0, phase));

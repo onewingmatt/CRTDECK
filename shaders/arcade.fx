@@ -31,15 +31,15 @@ float4 ArcadePS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_
 
     // Heavy staggered slot mask, plus a horizontal slot structure.
     float row = floor(uv.y * BUFFER_HEIGHT);
-    float col = floor(uv.x * BUFFER_WIDTH + fmod(row, 2.0) * 1.5);
-    float m = fmod(col, 3.0);
+    float col = floor(uv.x * BUFFER_WIDTH + (frac(row / 2.0) * 2.0) * 1.5);
+    float m = (frac(col / 3.0) * 3.0);
     float3 triad = (m < 1.0) ? float3(1.00, 0.35, 0.35)
                  : ((m < 2.0) ? float3(0.35, 1.00, 0.35)
                               : float3(0.35, 0.35, 1.00));
     float triadAvg = (1.00 + 0.35 + 0.35) / 3.0;
-    color *= lerp(float3(1.0), triad * (1.0 / triadAvg), MaskStrength);
+    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / triadAvg), MaskStrength);
     // Slot gaps: every 3rd row slightly darker.
-    color *= (fmod(row, 3.0) < 2.0) ? 1.0 : 0.85;
+    color *= ((frac(row / 3.0) * 3.0) < 2.0) ? 1.0 : 0.85;
 
     color *= 1.0 - r2 * 0.55;
     color *= 1.0 + ScanIntensity * 0.30;

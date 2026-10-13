@@ -24,14 +24,14 @@ float4 ShadowMaskPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) :
 
     // Dot triads: offset each row by half a triad so the dots stagger.
     float row = floor(texcoord.y * BUFFER_HEIGHT);
-    float col = floor(texcoord.x * BUFFER_WIDTH + fmod(row, 2.0) * 1.5);
-    float m = fmod(col, 3.0);
+    float col = floor(texcoord.x * BUFFER_WIDTH + (frac(row / 2.0) * 2.0) * 1.5);
+    float m = (frac(col / 3.0) * 3.0);
     // Rounder dots: soften the triad edges.
     float3 triad = (m < 1.0) ? float3(1.00, 0.55, 0.55)
                  : ((m < 2.0) ? float3(0.55, 1.00, 0.55)
                               : float3(0.55, 0.55, 1.00));
     float triadAvg = (1.00 + 0.55 + 0.55) / 3.0;
-    color *= lerp(float3(1.0), triad * (1.0 / triadAvg), MaskStrength);
+    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / triadAvg), MaskStrength);
 
     color *= 1.0 + ScanIntensity * 0.30;
 

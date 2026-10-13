@@ -33,12 +33,12 @@ float4 SlotMaskPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : S
 
     // Slot mask: RGB triads staggered by half a triad on alternate rows.
     float row = floor(uv.y * BUFFER_HEIGHT);
-    float col = floor(uv.x * BUFFER_WIDTH + fmod(row, 2.0) * 1.5);
-    float m = fmod(col, 3.0);
+    float col = floor(uv.x * BUFFER_WIDTH + (frac(row / 2.0) * 2.0) * 1.5);
+    float m = (frac(col / 3.0) * 3.0);
     float3 triad = (m < 1.0) ? float3(1.00, 0.40, 0.40)
                  : ((m < 2.0) ? float3(0.40, 1.00, 0.40)
                               : float3(0.40, 0.40, 1.00));
-    color *= lerp(float3(1.0), triad * (1.0 / 0.60), MaskStrength);
+    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / 0.60), MaskStrength);
 
     // Vignette sells the tube.
     color *= 1.0 - r2 * 0.55;

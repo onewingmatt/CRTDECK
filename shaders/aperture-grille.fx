@@ -24,12 +24,12 @@ float4 AperturePS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : S
 
     // Aperture grille: RGB triads, one triad = 3 output pixels.
     float col = floor(texcoord.x * BUFFER_WIDTH);
-    float m = fmod(col, 3.0);
+    float m = (frac(col / 3.0) * 3.0);
     float3 triad = (m < 1.0) ? float3(1.00, 0.40, 0.40)
                  : ((m < 2.0) ? float3(0.40, 1.00, 0.40)
                               : float3(0.40, 0.40, 1.00));
     // Each triad averages 0.60 per channel; dividing keeps average brightness constant.
-    color *= lerp(float3(1.0), triad * (1.0 / 0.60), MaskStrength);
+    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / 0.60), MaskStrength);
 
     color *= 1.0 + ScanIntensity * 0.30;
 

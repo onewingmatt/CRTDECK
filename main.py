@@ -61,6 +61,29 @@ def _param(key, label, default, maxv=1.0, minv=0.0, step=0.05):
             "step": step, "default": default}
 
 
+def _ssl_context():
+    """TLS context backed by the system CA store.
+
+    Decky's embedded Python ships without a CA bundle, so urllib downloads
+    fail here with CERTIFICATE_VERIFY_FAILED while curl and the system Python
+    on the same machine work fine.
+    """
+    import ssl
+    for path in ("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+                 "/etc/ssl/certs/ca-certificates.crt",
+                 "/etc/pki/tls/certs/ca-bundle.crt"):
+        if os.path.exists(path):
+            try:
+                return ssl.create_default_context(cafile=path)
+            except OSError:
+                continue
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001 - fall back to the default store
+        return ssl.create_default_context()
+
+
 PRESETS = [
     {
         "id": "scanlines",
@@ -316,7 +339,8 @@ class Plugin:
             zip_path = os.path.join(tmp, "heavy.zip")
             req = urllib.request.Request(
                 HEAVY_ZIP_URL, headers={"User-Agent": "deckycrt/0.1"})
-            with urllib.request.urlopen(req, timeout=120) as r, \
+            with urllib.request.urlopen(req, timeout=120,
+                                        context=_ssl_context()) as r, \
                     open(zip_path, "wb") as f:
                 shutil.copyfileobj(r, f)
             with zipfile.ZipFile(zip_path) as z:
@@ -437,7 +461,8 @@ class Plugin:
             zip_path = os.path.join(tmp, "pack.zip")
             req = urllib.request.Request(
                 pack["url"], headers={"User-Agent": "deckycrt/0.1"})
-            with urllib.request.urlopen(req, timeout=180) as r, \
+            with urllib.request.urlopen(req, timeout=180,
+                                        context=_ssl_context()) as r, \
                     open(zip_path, "wb") as f:
                 shutil.copyfileobj(r, f)
             with zipfile.ZipFile(zip_path) as z:

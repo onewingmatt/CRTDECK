@@ -29,11 +29,11 @@ float4 CompositePS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : 
 
     // Subtle fixed grille so it still reads as a tube.
     float col = floor(texcoord.x * BUFFER_WIDTH);
-    float m = fmod(col, 3.0);
+    float m = (frac(col / 3.0) * 3.0);
     float3 triad = (m < 1.0) ? float3(1.00, 0.55, 0.55)
                  : ((m < 2.0) ? float3(0.55, 1.00, 0.55)
                               : float3(0.55, 0.55, 1.00));
-    color *= lerp(float3(1.0), triad * (1.0 / 0.70), 0.22);
+    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / 0.70), 0.22);
 
     float phase = frac(texcoord.y * BUFFER_HEIGHT * 0.5);
     float band = smoothstep(0.0, 0.35, phase) * (1.0 - smoothstep(0.65, 1.0, phase));
