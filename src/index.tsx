@@ -31,15 +31,48 @@ interface RunningApp {
   name: string;
 }
 
-async function readLaunchOptions(appId: number): Promise<string> {
+// Decky plugins run inside Steam's UI, where the real SteamClient is on
+// window. Feature-detect everything: this build does NOT expose
+// SteamClient.Apps.GetAppDetails, and calling it unguarded throws inside a
+// React effect, which takes the whole panel down (the "Decky menu crashes"
+// failure). Other plugins on this box (BC250-Toolkit) guard the same way.
+function steamRoot(): any {
+  return (window as any).SteamClient;
+}
+
+function canWatchGameSessions(): boolean {
+  return (
+    typeof steamRoot()?.GameSessions?.RegisterForAppLifetimeNotifications ===
+    "function"
+  );
+}
+
+function canReadLaunchOptions(): boolean {
+  if (typeof steamRoot()?.Apps?.GetAppDetails === "function") return true;
+  return typeof (window as any).appDetailsStore?.GetAppDetails === "function";
+}
+
+// Returns null when the launch options could NOT be read. Callers must never
+// treat null as "" — writing "" would wipe the user's real launch options.
+async function readLaunchOptions(appId: number): Promise<string | null> {
   try {
-    // @decky/ui's SteamClient types omit Apps.GetAppDetails; it exists at
-    // runtime, so cast rather than redeclaring the whole global as any.
-    const details = await (SteamClient.Apps as any).GetAppDetails(appId);
-    return (details?.strLaunchOptions as string) ?? "";
+    const apps = steamRoot()?.Apps;
+    if (typeof apps?.GetAppDetails === "function") {
+      const d = await apps.GetAppDetails(appId);
+      if (typeof d?.strLaunchOptions === "string") return d.strLaunchOptions;
+    }
+    const store = (window as any).appDetailsStore;
+    if (typeof store?.GetAppDetails === "function") {
+      if (typeof store.RequestAppDetails === "function") {
+        await store.RequestAppDetails(appId);
+      }
+      const d2 = store.GetAppDetails(appId);
+      if (typeof d2?.strLaunchOptions === "string") return d2.strLaunchOptions;
+    }
   } catch {
-    return "";
+    /* fall through to null */
   }
+  return null;
 }
 
 // A rejected backend call must never surface as a raw panel error — that is
@@ -75,6 +108,7 @@ function Content() {
   const [status, setStatus] = useState<StatusInfo | null>(null);
   const [runningApp, setRunningApp] = useState<RunningApp | null>(null);
   const [perGameOn, setPerGameOn] = useState(false);
+  const [perGameAvailable, setPerGameAvailable] = useState(false);
   const [busy, setBusy] = useState(false);
   const debounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
@@ -101,40 +135,65 @@ function Content() {
       }
     })();
 
-    const unregister =
-      SteamClient.GameSessions.RegisterForAppLifetimeNotifications(
-        (data: any) => {
-          // Non-Steam shortcut appids arrive as signed int32.
-          const appId = (data.unAppID as number) >>> 0;
-          if (data.bRunning) {
-            (SteamClient.Apps as any)
-              .GetAppDetails(appId)
-              .then((d: any) =>
-                setRunningApp({
-                  appId,
-                  name: (d?.strDisplayName as string) ?? `App ${appId}`,
-                })
-              )
-              .catch(() => setRunningApp({ appId, name: `App ${appId}` }));
-          } else {
-            setRunningApp(null);
-          }
+    // Per-game mode needs APIs that not every Steam build exposes. Detect once;
+    // never call a missing method (that is what crashes the panel).
+    const canWatch = canWatchGameSessions();
+    const canRead = canReadLaunchOptions();
+    setPerGameAvailable(canWatch && canRead);
+    if (!canWatch) return;
+
+    let unregister: any = null;
+    try {
+      const register =
+        steamRoot().GameSessions.RegisterForAppLifetimeNotifications;
+      unregister = register((data: any) => {
+        // Non-Steam shortcut appids arrive as signed int32.
+        const appId = (data.unAppID as number) >>> 0;
+        if (!data.bRunning) {
+          setRunningApp(null);
+          return;
         }
-      );
-    // @decky/ui types this as Unregisterable, which is not callable.
-    return () => (unregister as unknown as () => void)();
+        // Only reached when the API passed detection; keep it defensive anyway.
+        const apps = steamRoot()?.Apps;
+        if (typeof apps?.GetAppDetails === "function") {
+          Promise.resolve(apps.GetAppDetails(appId))
+            .then((d: any) =>
+              setRunningApp({
+                appId,
+                name: (d?.strDisplayName as string) ?? `App ${appId}`,
+              })
+            )
+            .catch(() => setRunningApp({ appId, name: `App ${appId}` }));
+        } else {
+          setRunningApp({ appId, name: `App ${appId}` });
+        }
+      });
+    } catch (e) {
+      toastError("Game session watch", e);
+    }
+    return () => {
+      try {
+        if (typeof unregister === "function") unregister();
+        else if (typeof unregister?.unregister === "function") {
+          unregister.unregister();
+        }
+      } catch {
+        /* the panel is unloading anyway */
+      }
+    };
   }, []);
 
   // Sync the per-game toggle when the running app changes.
   useEffect(() => {
     (async () => {
-      if (!runningApp) {
+      if (!runningApp || !perGameAvailable) {
         setPerGameOn(false);
         return;
       }
-      setPerGameOn((await readLaunchOptions(runningApp.appId)).includes(WRAPPER_MARKER));
+      const cur = await readLaunchOptions(runningApp.appId);
+      setPerGameOn(cur !== null && cur.includes(WRAPPER_MARKER));
     })();
-  }, [runningApp]);
+  }, [runningApp, perGameAvailable]);
 
   const currentPreset = status?.presets.find((p) => p.id === status.preset_id);
   const currentParams =
@@ -234,6 +293,13 @@ function Content() {
 
   const handlePerGame = async (enable: boolean) => {
     if (!runningApp || !status) return;
+    if (!perGameAvailable) {
+      toaster.toast({
+        title: "DeckyCRT",
+        body: "This Steam build doesn't expose app launch options.",
+      });
+      return;
+    }
     const rel =
       status.presets.find((p) => p.id === status.preset_id)?.relpath ?? "";
     if (enable && !rel) {
@@ -244,6 +310,14 @@ function Content() {
       return;
     }
     const cur = await readLaunchOptions(runningApp.appId);
+    if (cur === null) {
+      // Never write on an unreadable value — it would wipe the user's options.
+      toaster.toast({
+        title: "DeckyCRT",
+        body: "Couldn't read this game's launch options — nothing changed.",
+      });
+      return;
+    }
     let next = cur;
     if (enable) {
       if (cur.includes(WRAPPER_MARKER)) {
@@ -259,8 +333,16 @@ function Content() {
       }
       next = cur.replace(/^gamescope --reshade-effect \S+ -- /, "");
     }
+    const setLaunchOptions = steamRoot()?.Apps?.SetAppLaunchOptions;
+    if (typeof setLaunchOptions !== "function") {
+      toaster.toast({
+        title: "DeckyCRT",
+        body: "This Steam build doesn't allow changing launch options.",
+      });
+      return;
+    }
     try {
-      await SteamClient.Apps.SetAppLaunchOptions(runningApp.appId, next);
+      await setLaunchOptions(runningApp.appId, next);
       let confirmed = false;
       for (let i = 0; i < 6; i++) {
         await new Promise((r) => setTimeout(r, 300));
@@ -269,7 +351,8 @@ function Content() {
           break;
         }
       }
-      setPerGameOn((await readLaunchOptions(runningApp.appId)).includes(WRAPPER_MARKER));
+      const after = await readLaunchOptions(runningApp.appId);
+      setPerGameOn(after !== null && after.includes(WRAPPER_MARKER));
       if (!confirmed)
         toaster.toast({
           title: "DeckyCRT",
@@ -363,9 +446,13 @@ function Content() {
         <PanelSection title="This game">
           <ToggleField
             label={runningApp.name}
-            description="Wrap this game's launch options in Gamescope + CRT."
+            description={
+              perGameAvailable
+                ? "Wrap this game's launch options in Gamescope + CRT."
+                : "Unavailable: this Steam build doesn't expose app launch options."
+            }
             checked={perGameOn}
-            disabled={!status.reshade_supported}
+            disabled={!status.reshade_supported || !perGameAvailable}
             onChange={handlePerGame}
           />
         </PanelSection>
