@@ -136,6 +136,37 @@ def main():
     check("clear_managed_apps empties the registry",
           (run(plugin.clear_managed_apps()), run(plugin.get_status())["managed_apps"])[1], {})
 
+    print("backend: crash detection parsers")
+    # The real coredumpctl rows and command line that this was written against:
+    # the per-game wrapper that took gamescope down when Risk of Rain Returns
+    # was launched.
+    core_row = ("Tue 2026-10-13 19:03:11 ADT 23952 1000 1000 SIGSEGV "
+                "inaccessible /usr/bin/gamescope -")
+    session_row = ("Tue 2026-10-13 18:20:00 ADT 4674 1000 1000 SIGABRT "
+                   "missing /usr/bin/gamescope -")
+    check("core row yields its pid", mod.Plugin._parse_core_line(core_row), "23952")
+    check("a non-core row yields nothing",
+          mod.Plugin._parse_core_line("No coredumps found."), None)
+    check("session gamescope core still yields its pid",
+          mod.Plugin._parse_core_line(session_row), "4674")
+
+    wrapped_cmd = (
+        "gamescope --reshade-effect deckycrt-community/rsretroarch/Shaders/"
+        "CRTLottes2.fx -- /usr/bin/steam-launch-wrapper -- /usr/bin/reaper "
+        "SteamLaunch AppId=1337520 -- /usr/bin/proton waitforexitandrun "
+        "/games/Risk of Rain Returns.exe")
+    check("wrapper command line yields the app id",
+          mod.Plugin._wrapper_appid_from_cmdline(wrapped_cmd), 1337520)
+    check("the session compositor is not one of our wrappers",
+          mod.Plugin._wrapper_appid_from_cmdline(
+              "/usr/bin/gamescope --touch-gestures --prefer-output *,eDP-1"), None)
+    check("another plugin's reshade wrapper is not ours",
+          mod.Plugin._wrapper_appid_from_cmdline(
+              "gamescope --reshade-effect /usr/share/other/x.fx -- "
+              "SteamLaunch AppId=123"), None)
+    check("running-wrapper probe returns a list",
+          isinstance(run(mod.Plugin().wrapped_running_apps()).get("app_ids"), list), True)
+
     print("backend: config file on disk")
     cfg_path = os.path.join(home, ".config", "deckycrt", "config.json")
     check("config.json exists", os.path.isfile(cfg_path), True)

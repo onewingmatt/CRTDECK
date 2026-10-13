@@ -92,6 +92,23 @@ const setGlobalEnabled = callable("set_global_enabled");
 const downloadPack = callable("download_pack");
 const removePack = callable("remove_pack");
 /**
+ * Record a line in the plugin's own log file. The panel's console output only
+ * reaches Steam's CEF console, which is not always written to disk; this is the
+ * channel that survives.
+ */
+const note = callable("note");
+/**
+ * Games whose launch died with gamescope while running under our per-game
+ * wrapper. Those games cannot start until the wrapper is stripped.
+ */
+const checkWrapperCrashes = callable("check_wrapper_crashes");
+/**
+ * App ids running right now under our nested gamescope. A saved wrapper only
+ * applies at the next launch; this says whether it is filtering the process
+ * that is on screen, which is what makes system-wide double-apply.
+ */
+const wrappedRunningApps = callable("wrapped_running_apps");
+/**
  * Remember (or forget) a game whose launch options carry our wrapper.
  *
  * The registry is what lets a later Off / System-wide switch clean up a game
@@ -475,14 +492,38 @@ async function writeLaunchOptions(appId, value) {
     return false;
 }
 
+/**
+ * Build identity for the panel.
+ *
+ * Decky serves a plugin's bundle from a fixed URL, so a panel that was already
+ * loaded can keep running the previous build while the file on disk has moved
+ * on — which makes "I deployed the fix" indistinguishable from "the fix is
+ * live" from the outside. The panel reports this string to the plugin log on
+ * mount, so the log answers which build actually ran.
+ *
+ * Bump it whenever a change needs to be confirmed on the device.
+ */
+const PLUGIN_BUILD = "0.4.0-crashguard";
+
 function toast(body) {
     toaster.toast({ title: "DeckyCRT", body });
+}
+/**
+ * A mode change that "does nothing" otherwise leaves no trace the user can
+ * look at. Every decision goes to Steam's CEF console AND to the plugin's own
+ * log file (through the backend), because the CEF console is not reliably
+ * written to disk and a deployed fix that never ran is indistinguishable from
+ * one that ran and failed.
+ */
+function diag(message) {
+    log(message);
+    void note(message).catch(() => undefined);
 }
 // A rejected backend call must never surface as a raw panel error — that is
 // what the "an error occurred in DeckyCRT" banner actually is.
 function toastError(what, e) {
     toast(`${what} failed — see the plugin log`);
-    console.error("DeckyCRT:", what, e);
+    diag(`${what} failed: ${String(e)}`);
 }
 // The backend derives these ranges, but the panel must not trust any of it:
 // a SliderField with a value outside [min, max] takes the whole panel down.
@@ -503,6 +544,12 @@ function shaderPathFor(status, presetId) {
     const id = status.preset_id;
     return status.presets.find((p) => p.id === id)?.relpath ?? "";
 }
+/** One source of truth for the mode: live state, never a stored flag. */
+function modeOf(globalEnabled, appScoped) {
+    if (globalEnabled)
+        return "system";
+    return appScoped ? "app" : "off";
+}
 function Content() {
     const [status, setStatus] = SP_REACT.useState(null);
     const [runningApp, setRunningApp] = SP_REACT.useState(null);
@@ -510,6 +557,7 @@ function Content() {
     // null = the running game's options could not be read; do not guess "off".
     const [runningWrapper, setRunningWrapper] = SP_REACT.useState(null);
     const [busy, setBusy] = SP_REACT.useState(false);
+    const [recoveryRan, setRecoveryRan] = SP_REACT.useState(false);
     const debounceTimers = SP_REACT.useRef({});
     const refresh = async () => {
         try {
@@ -528,66 +576,15 @@ function Content() {
             return;
         }
         const cur = await readLaunchOptions(app.appId);
-        const path = cur === null ? null : wrapperPath(cur);
-        setRunningWrapper(path);
-        log(`running app ${app.appId} (${app.name}) launch options ` +
+        setRunningWrapper(cur === null ? null : wrapperPath(cur));
+        diag(`running app ${app.appId} (${app.name}) options ` +
             (cur === null ? "unreadable" : JSON.stringify(cur)));
     };
-    SP_REACT.useEffect(() => {
-        (async () => {
-            try {
-                let s = await getStatus();
-                if (!s.shaders_installed) {
-                    await installShaders();
-                    s = await getStatus();
-                }
-                setStatus(s);
-            }
-            catch (e) {
-                toastError("Initial load", e);
-            }
-        })();
-        // GameSessions.RegisterForAppLifetimeNotifications rejects with "Unknown
-        // method" on this Steam build despite existing, so poll the Router store
-        // the way the other working plugins here do. Coalesce and only update when
-        // the app actually changes.
-        setCaps(capabilities());
-        const poll = () => {
-            const app = readRunningApp();
-            setRunningApp((current) => current?.appId === app?.appId && current?.name === app?.name
-                ? current
-                : app);
-        };
-        poll();
-        const interval = globalThis.setInterval(poll, 1500);
-        return () => globalThis.clearInterval(interval);
-    }, []);
-    // Re-read the wrapper state whenever the foreground app changes.
-    SP_REACT.useEffect(() => {
-        void refreshRunningWrapper(runningApp);
-    }, [runningApp]);
-    if (!status) {
-        return (SP_JSX.jsx(DFL.PanelSection, { title: "DeckyCRT", children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "Loading\u2026" }) }) }));
-    }
-    const managed = status.managed_apps ?? {};
-    const managedEntries = Object.entries(managed);
-    const managedCount = managedEntries.length;
-    const appScoped = runningWrapper !== null || managedCount > 0;
-    // One source of truth: the live session property plus the wrappers actually
-    // saved in Steam. No separate "current mode" flag that can drift.
-    const filterMode = status.global_enabled
-        ? "system"
-        : appScoped
-            ? "app"
-            : "off";
-    const currentPreset = status.presets.find((p) => p.id === status.preset_id);
-    const currentParams = currentPreset && status.params[currentPreset.id]
-        ? status.params[currentPreset.id]
-        : {};
-    const presetOptions = status.presets.map((p) => ({
-        data: p.id,
-        label: p.name + (p.heavy ? " (heavy)" : ""),
-    }));
+    // ------------------------------------------------------------- operations
+    // Declared before the effects and before the loading return: the effect that
+    // fires on the render where the first status arrives must not reach a
+    // temporal-dead-zone binding. Nothing here reads the derived values below,
+    // so every one of these is safe to call from that effect.
     /**
      * Install or strip the wrapper for one game, then record it.
      *
@@ -597,17 +594,17 @@ function Content() {
     const applyWrapper = async (appId, name, enable, rel, prior) => {
         const cur = await readLaunchOptions(appId);
         if (cur === null) {
-            log(`cannot read launch options for ${appId} (${name}) — not touching`);
+            diag(`cannot read launch options for ${appId} (${name}) — not touching`);
             return false;
         }
         if (enable) {
             if (!rel) {
-                log("no shader path for the selected preset — cannot enable");
+                diag("no shader path for the selected preset — cannot enable");
                 return false;
             }
             const res = installWrapper(cur, rel);
             if (res.blocked === "foreign-gamescope") {
-                log(`${appId} already has a gamescope wrapper — refusing to stack`);
+                diag(`${appId} already has a gamescope wrapper — refusing to stack`);
                 return false;
             }
             const tracked = prior?.added_command === true;
@@ -617,6 +614,8 @@ function Content() {
                 return true;
             }
             const ok = await writeLaunchOptions(appId, res.options);
+            diag(`wrap ${appId} (${name}): ${JSON.stringify(cur)} -> ` +
+                `${JSON.stringify(res.options)} ok=${ok}`);
             if (ok) {
                 await setManagedApp(appId, name, rel, true, res.addedCommand ?? tracked);
             }
@@ -628,16 +627,19 @@ function Content() {
             return true;
         }
         const ok = await writeLaunchOptions(appId, res.options);
+        diag(`unwrap ${appId} (${name}): ${JSON.stringify(cur)} -> ` +
+            `${JSON.stringify(res.options)} ok=${ok}`);
         if (ok)
             await setManagedApp(appId, name, rel, false, false);
         return ok;
     };
     /** Strip the per-game wrapper everywhere it is known to be. */
     const clearAppScope = async (rel) => {
+        const managed = status?.managed_apps ?? {};
         const targets = [];
         if (runningApp)
             targets.push(runningApp);
-        for (const [id, info] of managedEntries) {
+        for (const [id, info] of Object.entries(managed)) {
             const appId = Number(id);
             if (!Number.isFinite(appId) || appId <= 0)
                 continue;
@@ -655,12 +657,58 @@ function Content() {
             await clearManagedApps();
         return ok;
     };
+    /**
+     * Rescue a game whose launch died with gamescope.
+     *
+     * The wrapper puts gamescope in the game's launch path, so a crash there
+     * means the game never starts at all — which reads to the user as "this game
+     * won't launch any more". The core dump names the app id, so the wrapper
+     * that did it can be removed instead of leaving the game unlaunchable.
+     */
+    const recoverFromWrapperCrashes = async (s) => {
+        const managed = s.managed_apps ?? {};
+        if (!Object.keys(managed).length)
+            return false;
+        let res;
+        try {
+            res = await checkWrapperCrashes();
+        }
+        catch (e) {
+            toastError("Wrapper crash check", e);
+            return false;
+        }
+        if (!res?.crashes?.length)
+            return false;
+        const rel = shaderPathFor(s);
+        const cleaned = [];
+        const stuck = [];
+        for (const crash of res.crashes) {
+            const ok = await applyWrapper(crash.app_id, crash.name, false, rel, managed[String(crash.app_id)]);
+            diag(`crash recovery: wrapper for ${crash.app_id} (${crash.name}, ` +
+                `${crash.shader}) ${ok ? "removed" : "COULD NOT BE REMOVED"}`);
+            if (ok && !cleaned.includes(crash.name))
+                cleaned.push(crash.name);
+            if (!ok && !stuck.includes(crash.name))
+                stuck.push(crash.name);
+        }
+        if (cleaned.length) {
+            toast(`Gamescope crashed starting ${cleaned.join(", ")} under a saved CRT wrapper — the wrapper was removed, so the game launches normally again.`);
+        }
+        if (stuck.length) {
+            toast(`Couldn't remove the saved wrapper for ${stuck.join(", ")} — see the plugin log.`);
+        }
+        return cleaned.length > 0;
+    };
     const handleModeChange = async (mode) => {
-        if (busy || mode === filterMode)
+        if (busy || !status)
+            return;
+        const managed = status.managed_apps ?? {};
+        const current = modeOf(status.global_enabled, runningWrapper !== null || Object.keys(managed).length > 0);
+        if (mode === current)
             return;
         setBusy(true);
         const rel = shaderPathFor(status);
-        log(`mode -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`);
+        diag(`mode ${current} -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`);
         try {
             if (mode === "off") {
                 const cleared = await clearAppScope(rel);
@@ -676,6 +724,27 @@ function Content() {
                 toast(detail);
             }
             else if (mode === "system") {
+                // A game already running under its own wrapped gamescope keeps
+                // filtering for the life of that process: system-wide would filter the
+                // same pixels a second time (double blur, double cost) and no launch
+                // option can stop it. Refuse instead of stacking.
+                let live = [];
+                try {
+                    const probe = await wrappedRunningApps();
+                    if (probe?.ok)
+                        live = probe.app_ids ?? [];
+                }
+                catch (e) {
+                    toastError("Running-wrapper check", e);
+                }
+                if (live.length) {
+                    const names = live
+                        .map((id) => managed[String(id)]?.name ?? `App ${id}`)
+                        .join(", ");
+                    diag(`system-wide refused: ${names} is running under our wrapper`);
+                    toast(`${names} is already running under its own CRT, and both would filter the same picture (double blur). Close that game first, or set the filter to Off.`);
+                    return;
+                }
                 const cleared = await clearAppScope(rel);
                 if (!cleared) {
                     toast("Couldn't clear every saved per-game wrapper, so system-wide was not enabled — they must not stack.");
@@ -737,6 +806,7 @@ function Content() {
                 if (await applyWrapper(appId, info.name, true, rel, info))
                     ok++;
             }
+            diag(`preset ${presetId}: re-pointed ${ok}/${tracked.length} saved wrapper(s)`);
             if (ok !== tracked.length) {
                 toast(`Updated the saved wrapper for ${ok} of ${tracked.length} game(s) — see the plugin log.`);
             }
@@ -751,7 +821,7 @@ function Content() {
     const handleRemoveWrappers = async () => {
         setBusy(true);
         try {
-            const ok = await clearAppScope(shaderPathFor(status));
+            const ok = await clearAppScope(shaderPathFor(status ?? (await getStatus())));
             toast(ok
                 ? "Per-game wrappers removed."
                 : "Some wrappers could not be cleared — see the plugin log.");
@@ -828,6 +898,69 @@ function Content() {
             toastError("Pack removal", e);
         }
     };
+    // ----------------------------------------------------------------- effects
+    SP_REACT.useEffect(() => {
+        diag(`panel build ${PLUGIN_BUILD} mounted`);
+        (async () => {
+            try {
+                let s = await getStatus();
+                if (!s.shaders_installed) {
+                    await installShaders();
+                    s = await getStatus();
+                }
+                setStatus(s);
+            }
+            catch (e) {
+                toastError("Initial load", e);
+            }
+        })();
+        // GameSessions.RegisterForAppLifetimeNotifications rejects with "Unknown
+        // method" on this Steam build despite existing, so poll the Router store
+        // the way the other working plugins here do. Coalesce and only update when
+        // the app actually changes.
+        setCaps(capabilities());
+        const poll = () => {
+            const app = readRunningApp();
+            setRunningApp((current) => current?.appId === app?.appId && current?.name === app?.name
+                ? current
+                : app);
+        };
+        poll();
+        const interval = globalThis.setInterval(poll, 1500);
+        return () => globalThis.clearInterval(interval);
+    }, []);
+    // Re-read the wrapper state whenever the foreground app changes.
+    SP_REACT.useEffect(() => {
+        void refreshRunningWrapper(runningApp);
+    }, [runningApp]);
+    // Once, after the first status arrives: rescue any game left unlaunchable by
+    // a gamescope crash under our wrapper.
+    SP_REACT.useEffect(() => {
+        if (!status || recoveryRan)
+            return;
+        setRecoveryRan(true);
+        (async () => {
+            if (await recoverFromWrapperCrashes(status))
+                await refresh();
+        })();
+    }, [status, recoveryRan]);
+    if (!status) {
+        return (SP_JSX.jsx(DFL.PanelSection, { title: "DeckyCRT", children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "Loading\u2026" }) }) }));
+    }
+    // ------------------------------------------------------------ derived view
+    const managed = status.managed_apps ?? {};
+    const managedEntries = Object.entries(managed);
+    const managedCount = managedEntries.length;
+    const appScoped = runningWrapper !== null || managedCount > 0;
+    const filterMode = modeOf(status.global_enabled, appScoped);
+    const currentPreset = status.presets.find((p) => p.id === status.preset_id);
+    const currentParams = currentPreset && status.params[currentPreset.id]
+        ? status.params[currentPreset.id]
+        : {};
+    const presetOptions = status.presets.map((p) => ({
+        data: p.id,
+        label: p.name + (p.heavy ? " (heavy)" : ""),
+    }));
     const modeOptions = [
         { data: "off", label: "Off" },
         {
@@ -855,7 +988,7 @@ function Content() {
                             .filter(paramIsUsable)
                             .slice(0, 12)
                             .map((param) => (SP_JSX.jsx(DFL.SliderField, { label: param.label, min: param.min, max: param.max, step: param.step, value: sliderValue(param, currentParams[param.key]), onChange: (v) => handleSlider(status.preset_id, param.key, v) }, param.key)))
-                        : null, filterMode === "app" && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "Slider changes rewrite the shader file; a game that is already running keeps its compiled copy until it restarts." }) }))] }), managedCount > 0 && (SP_JSX.jsxs(DFL.PanelSection, { title: "Saved per-game filters", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.85 }, children: managedNames }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "These games start under Gamescope with the selected preset. Removing the wrappers restores each game's original launch options." }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: handleRemoveWrappers, children: busy ? "Working…" : "Remove saved wrappers" })] })), !caps?.canWriteLaunchOptions && (SP_JSX.jsx(DFL.PanelSection, { title: "Steam integration", children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "This Steam build doesn't expose launch-option editing, so active-app mode is unavailable. System-wide mode still works." }) }) })), SP_JSX.jsxs(DFL.PanelSection, { title: "Community packs", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: "Curated shader collections from the community. Experimental \u2014 some shaders may not compile on your Gamescope build. New presets appear in the list above after downloading." }) }), status.community_packs.map((pack) => (SP_JSX.jsxs("div", { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "0.9em" }, children: [SP_JSX.jsx("div", { children: pack.name }), SP_JSX.jsx("div", { style: { opacity: 0.7, fontSize: "0.9em" }, children: pack.description })] }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: () => pack.installed
+                        : null, filterMode === "app" && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "Slider changes rewrite the shader file; a game that is already running keeps its compiled copy until it restarts." }) }))] }), managedCount > 0 && (SP_JSX.jsxs(DFL.PanelSection, { title: "Saved per-game filters", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.85 }, children: managedNames }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "These games start under Gamescope with the selected preset. Removing the wrappers restores each game's original launch options. A game that is already running keeps its filter until it restarts." }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: handleRemoveWrappers, children: busy ? "Working…" : "Remove saved wrappers" })] })), !caps?.canWriteLaunchOptions && (SP_JSX.jsx(DFL.PanelSection, { title: "Steam integration", children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "This Steam build doesn't expose launch-option editing, so active-app mode is unavailable. System-wide mode still works." }) }) })), SP_JSX.jsxs(DFL.PanelSection, { title: "Community packs", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: "Curated shader collections from the community. Experimental \u2014 some shaders may not compile on your Gamescope build, and a community shader under the per-game wrapper is the least tested combination here. New presets appear in the list above after downloading." }) }), status.community_packs.map((pack) => (SP_JSX.jsxs("div", { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "0.9em" }, children: [SP_JSX.jsx("div", { children: pack.name }), SP_JSX.jsx("div", { style: { opacity: 0.7, fontSize: "0.9em" }, children: pack.description })] }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: () => pack.installed
                                     ? handleRemovePack(pack.id)
                                     : handleDownloadPack(pack.id), children: busy
                                     ? "Working…"

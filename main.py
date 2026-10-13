@@ -723,6 +723,135 @@ class Plugin:
         return True
 
     # ------------------------------------------------------------ app registry
+    async def note(self, message: str) -> dict:
+        """Record a line from the panel in this plugin's own log.
+
+        The panel's `console.log` only reaches Steam's CEF console, which is not
+        always written to disk and is useless when a mode change "does nothing".
+        Anything the panel wants to be checkable goes through here as well.
+        """
+        decky.logger.info("DeckyCRT/panel: %s", str(message)[:400])
+        return {"ok": True, "detail": ""}
+
+    @staticmethod
+    def _parse_core_line(line: str) -> str | None:
+        """PID from a `coredumpctl list` row, or None if it is not a core row.
+
+        The timestamp has a variable number of words (weekday, date, time,
+        timezone), so the PID is matched as the number preceding the three
+        numeric columns that follow it, not by position.
+        """
+        m = re.search(r"\b(\d{1,7})\s+\d+\s+\d+\s+SIG[A-Z]+\b", line)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _wrapper_appid_from_cmdline(cmdline: str) -> int | None:
+        """App id when a gamescope command line is one of OUR per-game wrappers."""
+        if "--reshade-effect" not in cmdline or "deckycrt" not in cmdline:
+            return None
+        m = re.search(r"AppId=(\d+)", cmdline)
+        return int(m.group(1)) if m else None
+
+    def _wrapped_running_apps(self) -> list:
+        """Apps running RIGHT NOW under our nested gamescope.
+
+        This is how the panel can tell "the per-game filter is live in this
+        process" from "a wrapper is merely saved for next launch" — the two
+        look identical in Steam's saved options, and only the first one means
+        system-wide would filter the same pixels twice.
+        """
+        found = set()
+        try:
+            p = subprocess.run(["ps", "-eo", "args"], capture_output=True,
+                               text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        for line in p.stdout.splitlines():
+            app_id = self._wrapper_appid_from_cmdline(line)
+            if app_id is not None:
+                found.add(app_id)
+        return sorted(found)
+
+    async def wrapped_running_apps(self) -> dict:
+        return {"ok": True, "app_ids": self._wrapped_running_apps()}
+
+    def _gamescope_core_pids(self, since: str) -> list:
+        if not shutil.which("coredumpctl"):
+            return []
+        try:
+            p = subprocess.run(["coredumpctl", "list", "--no-pager",
+                                "--since", since],
+                               capture_output=True, text=True, timeout=25)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        pids = []
+        for line in p.stdout.splitlines():
+            if "gamescope" not in line:
+                continue
+            pid = self._parse_core_line(line)
+            if pid:
+                pids.append(pid)
+        return pids
+
+    def _core_cmdline(self, pid: str) -> str:
+        try:
+            p = subprocess.run(["coredumpctl", "info", pid, "--no-pager"],
+                               capture_output=True, text=True, timeout=25)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        lines = p.stdout.splitlines()
+        for i, line in enumerate(lines):
+            if "Command Line:" not in line:
+                continue
+            chunk = [line.split("Command Line:", 1)[1]]
+            # The command line can wrap; stop at the next field.
+            for nxt in lines[i + 1:]:
+                if ":" in nxt and nxt.strip().split(":", 1)[0].isalpha():
+                    break
+                chunk.append(nxt)
+            return " ".join(chunk)
+        return ""
+
+    async def check_wrapper_crashes(self) -> dict:
+        """Detect a game whose launch died with gamescope and report it.
+
+        A per-game wrapper puts gamescope in the launch path of the game, so a
+        gamescope crash there means the game never starts — which reads to the
+        user as "this game will not launch any more". The core dump names both
+        the wrapper and the app id, so the panel can strip exactly the wrapper
+        that is doing it instead of leaving the game unlaunchable.
+        """
+        cfg = self._load_config()
+        managed = cfg.get("managed_apps") or {}
+        if not managed:
+            return {"ok": True, "crashes": []}
+        seen = {str(x) for x in (cfg.get("crash_scan_seen") or [])}
+        crashes = []
+        new_pids = []
+        for pid in self._gamescope_core_pids("3 days ago"):
+            if pid in seen:
+                continue
+            new_pids.append(pid)
+            cmdline = self._core_cmdline(pid)
+            app_id = self._wrapper_appid_from_cmdline(cmdline)
+            if app_id is None or str(app_id) not in managed:
+                continue
+            entry = managed[str(app_id)]
+            crashes.append({
+                "app_id": app_id,
+                "name": entry.get("name") or f"App {app_id}",
+                "shader": entry.get("relpath") or "",
+            })
+        if new_pids:
+            cfg["crash_scan_seen"] = (sorted(seen | set(new_pids)))[-50:]
+            self._save_config(cfg)
+        if crashes:
+            decky.logger.error(
+                "DeckyCRT: gamescope crashed launching %s under a per-game "
+                "wrapper; the wrapper should be removed",
+                ", ".join(str(c["app_id"]) for c in crashes))
+        return {"ok": True, "crashes": crashes}
+
     async def set_managed_app(self, app_id: int, name: str, relpath: str,
                               enabled: bool,
                               added_command: bool = False) -> dict:

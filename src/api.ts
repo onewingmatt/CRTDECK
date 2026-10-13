@@ -77,6 +77,30 @@ export const removePack =
   callable<[pack_id: string], ActionResult>("remove_pack");
 
 /**
+ * Record a line in the plugin's own log file. The panel's console output only
+ * reaches Steam's CEF console, which is not always written to disk; this is the
+ * channel that survives.
+ */
+export const note = callable<[message: string], ActionResult>("note");
+
+/**
+ * Games whose launch died with gamescope while running under our per-game
+ * wrapper. Those games cannot start until the wrapper is stripped.
+ */
+export const checkWrapperCrashes = callable<
+  [],
+  { ok: boolean; crashes: Array<{ app_id: number; name: string; shader: string }> }
+>("check_wrapper_crashes");
+
+/**
+ * App ids running right now under our nested gamescope. A saved wrapper only
+ * applies at the next launch; this says whether it is filtering the process
+ * that is on screen, which is what makes system-wide double-apply.
+ */
+export const wrappedRunningApps =
+  callable<[], { ok: boolean; app_ids: number[] }>("wrapped_running_apps");
+
+/**
  * Remember (or forget) a game whose launch options carry our wrapper.
  *
  * The registry is what lets a later Off / System-wide switch clean up a game
