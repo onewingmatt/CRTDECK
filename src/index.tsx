@@ -265,14 +265,20 @@ function Content() {
     return cleaned.length > 0;
   };
 
+  const modeBusyRef = useRef(false);
+
   const handleModeChange = async (mode: FilterMode) => {
-    if (busy || !status) return;
+    // Decky's dropdown can deliver repeated activation events before React has
+    // rendered `busy=true`; guard synchronously so a fast double-press cannot
+    // interleave enable/disable writes to Gamescope's property.
+    if (modeBusyRef.current || busy || !status) return;
     const managed = status.managed_apps ?? {};
     const current = modeOf(
       status.global_enabled,
       runningWrapper !== null || Object.keys(managed).length > 0
     );
     if (mode === current) return;
+    modeBusyRef.current = true;
     setBusy(true);
     const rel = shaderPathFor(status);
     diag(
@@ -356,6 +362,7 @@ function Content() {
     } finally {
       await refresh();
       await refreshRunningWrapper(runningApp);
+      modeBusyRef.current = false;
       setBusy(false);
     }
   };

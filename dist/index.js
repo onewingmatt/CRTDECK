@@ -699,13 +699,18 @@ function Content() {
         }
         return cleaned.length > 0;
     };
+    const modeBusyRef = SP_REACT.useRef(false);
     const handleModeChange = async (mode) => {
-        if (busy || !status)
+        // Decky's dropdown can deliver repeated activation events before React has
+        // rendered `busy=true`; guard synchronously so a fast double-press cannot
+        // interleave enable/disable writes to Gamescope's property.
+        if (modeBusyRef.current || busy || !status)
             return;
         const managed = status.managed_apps ?? {};
         const current = modeOf(status.global_enabled, runningWrapper !== null || Object.keys(managed).length > 0);
         if (mode === current)
             return;
+        modeBusyRef.current = true;
         setBusy(true);
         const rel = shaderPathFor(status);
         diag(`mode ${current} -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`);
@@ -779,6 +784,7 @@ function Content() {
         finally {
             await refresh();
             await refreshRunningWrapper(runningApp);
+            modeBusyRef.current = false;
             setBusy(false);
         }
     };
