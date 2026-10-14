@@ -71,6 +71,14 @@ def main():
     run = asyncio.run
 
     print("backend: shaders + status")
+    old_displays, old_xprop = plugin._gamescope_displays, plugin._xprop
+    try:
+        plugin._gamescope_displays = lambda: [":0"]
+        plugin._xprop = lambda *args: (1, "xprop: unable to open display")
+        check("failed live read stays unknown in status",
+              run(plugin.get_status())["global_enabled"], None)
+    finally:
+        plugin._gamescope_displays, plugin._xprop = old_displays, old_xprop
     check("install_shaders succeeds", run(plugin.install_shaders()), True)
     status = run(plugin.get_status())
     check("status reports shaders installed", status["shaders_installed"], True)
@@ -239,6 +247,28 @@ def main():
         plugin._resolve_relpath = saved["resolve"]
         mod.shutil.which = saved["which"]
         mod.asyncio.sleep = saved["sleep"]
+
+    print("backend: wrapped-app probe failures fail closed")
+    original_run = mod.subprocess.run
+    try:
+        def timeout_ps(*args, **kwargs):
+            if args and args[0] == ["ps", "-eo", "args"]:
+                raise mod.subprocess.TimeoutExpired(args[0], 10)
+            return original_run(*args, **kwargs)
+        mod.subprocess.run = timeout_ps
+        probe = run(plugin.wrapped_running_apps())
+        check("timeout returns probe failure", probe["ok"], False)
+        check("timeout includes no guessed app IDs", probe["app_ids"], [])
+
+        def failed_ps(*args, **kwargs):
+            if args and args[0] == ["ps", "-eo", "args"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="denied")
+            return original_run(*args, **kwargs)
+        mod.subprocess.run = failed_ps
+        probe = run(plugin.wrapped_running_apps())
+        check("nonzero ps returns probe failure", probe["ok"], False)
+    finally:
+        mod.subprocess.run = original_run
 
     print("backend: crash detection parsers")
     # The real coredumpctl rows and command line that this was written against:

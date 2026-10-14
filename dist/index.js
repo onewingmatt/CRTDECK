@@ -503,7 +503,7 @@ async function writeLaunchOptions(appId, value) {
  *
  * Bump it whenever a change needs to be confirmed on the device.
  */
-const PLUGIN_BUILD = "0.4.2-effectparse";
+const PLUGIN_BUILD = "0.4.3-failclosed";
 
 function toast(body) {
     toaster.toast({ title: "DeckyCRT", body });
@@ -699,6 +699,8 @@ function Content() {
         }
         return cleaned.length > 0;
     };
+    // Shared synchronous guard for every operation that mutates filter state.
+    // React's busy state update is asynchronous and cannot serialize rapid events.
     const modeBusyRef = SP_REACT.useRef(false);
     const handleModeChange = async (mode) => {
         // Decky's dropdown can deliver repeated activation events before React has
@@ -710,7 +712,9 @@ function Content() {
         setBusy(true);
         const managed = status.managed_apps ?? {};
         const rel = shaderPathFor(status);
-        const current = modeOf(status.global_enabled, runningWrapper !== null || Object.keys(managed).length > 0);
+        const current = status.global_enabled === null
+            ? "unknown"
+            : modeOf(status.global_enabled, runningWrapper !== null || Object.keys(managed).length > 0);
         diag(`mode ${current} -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`);
         try {
             // No early return when mode === current. The panel's idea of the current
@@ -718,19 +722,37 @@ function Content() {
             // refusing here is how a real press turns into a silent no-op. Every
             // branch below is idempotent and always reports its result.
             if (mode === "off") {
+                let liveGames = null;
+                try {
+                    liveGames = await wrappedRunningApps();
+                }
+                catch (e) {
+                    diag(`Off: running-wrapper probe failed: ${String(e)}`);
+                }
+                // A failed diagnostic probe must not block cleanup/disable.
                 const cleared = await clearAppScope(rel);
-                let detail = "CRT filter off.";
-                // Always ask for off instead of trusting the panel's copy of the flag:
-                // the backend verifies the live property and answers idempotently, so
-                // a stale "already off" here would leave a live filter running.
-                const res = await setGlobalEnabled(false);
-                if (!res.ok)
-                    detail = res.detail;
+                // If the Gamescope property is unreadable, still remove persistent
+                // per-game launch wrappers, but cannot promise the global layer is off.
+                const globalResult = await setGlobalEnabled(false);
+                let detail = globalResult.ok ? "Saved filters cleared; system filter is off." : globalResult.detail;
+                if (liveGames?.ok && (liveGames.app_ids ?? []).length) {
+                    const names = liveGames.app_ids
+                        .map((id) => managed[String(id)]?.name ?? `App ${id}`)
+                        .join(", ");
+                    detail += ` ${names} is already running under its saved filter; that process keeps filtering until it exits.`;
+                }
+                else if (!liveGames?.ok) {
+                    detail += " Could not check whether a game is still running under its own filter.";
+                }
                 if (!cleared) {
                     detail +=
                         " Some saved per-game wrappers could not be read or cleared — see the plugin log.";
                 }
                 toast(detail);
+            }
+            else if (status.global_enabled === null) {
+                toast("Couldn't read Gamescope's live filter state, so no mode change was made.");
+                return;
             }
             else if (mode === "system") {
                 // A game already running under its own wrapped gamescope keeps
@@ -759,6 +781,21 @@ function Content() {
                 const cleared = await clearAppScope(rel);
                 if (!cleared) {
                     toast("Couldn't clear every saved per-game wrapper, so system-wide was not enabled — they must not stack.");
+                    return;
+                }
+                // clearAppScope removes launch-option wrappers; an already-running
+                // nested Gamescope remains active until that game exits. Re-probe after
+                // cleanup so a race with game launch cannot stack global filtering.
+                const afterCleanup = await wrappedRunningApps();
+                if (!afterCleanup?.ok) {
+                    toast("Could not re-check running games after cleanup; system-wide was not enabled.");
+                    return;
+                }
+                if ((afterCleanup.app_ids ?? []).length) {
+                    const names = afterCleanup.app_ids
+                        .map((id) => managed[String(id)]?.name ?? `App ${id}`)
+                        .join(", ");
+                    toast(`${names} is already filtering until it exits. System-wide was not enabled.`);
                     return;
                 }
                 const res = await setGlobalEnabled(true);
@@ -809,6 +846,10 @@ function Content() {
         }
     };
     const handlePreset = async (presetId) => {
+        if (modeBusyRef.current || busy)
+            return;
+        modeBusyRef.current = true;
+        setBusy(true);
         try {
             const res = await setPreset(presetId);
             if (!res.ok) {
@@ -843,8 +884,15 @@ function Content() {
         catch (e) {
             toastError("Preset switch", e);
         }
+        finally {
+            modeBusyRef.current = false;
+            setBusy(false);
+        }
     };
     const handleRemoveWrappers = async () => {
+        if (modeBusyRef.current || busy)
+            return;
+        modeBusyRef.current = true;
         setBusy(true);
         try {
             const ok = await clearAppScope(shaderPathFor(status ?? (await getStatus())));
@@ -858,11 +906,15 @@ function Content() {
             toastError("Wrapper cleanup", e);
         }
         finally {
+            modeBusyRef.current = false;
             setBusy(false);
         }
     };
     const handleSlider = (presetId, key, value) => {
-        // Optimistic UI update; bake into the shader file after a short pause.
+        // Do not queue a delayed shader reapply while another mode transition is
+        // in progress; it could resurrect the filter after the user selects Off.
+        if (busy || modeBusyRef.current)
+            return;
         setStatus((prev) => prev
             ? {
                 ...prev,
@@ -886,6 +938,11 @@ function Content() {
             }
         }, 600);
     };
+    SP_REACT.useEffect(() => () => {
+        for (const timer of Object.values(debounceTimers.current))
+            clearTimeout(timer);
+        debounceTimers.current = {};
+    }, []);
     const handleDownloadHeavy = async () => {
         setBusy(true);
         try {
@@ -978,7 +1035,10 @@ function Content() {
     const managedEntries = Object.entries(managed);
     const managedCount = managedEntries.length;
     const appScoped = runningWrapper !== null || managedCount > 0;
-    const filterMode = modeOf(status.global_enabled, appScoped);
+    const filterMode = status.global_enabled === null
+        ? "off"
+        : modeOf(status.global_enabled, appScoped);
+    const modeReadable = status.global_enabled !== null;
     const currentPreset = status.presets.find((p) => p.id === status.preset_id);
     const currentParams = currentPreset && status.params[currentPreset.id]
         ? status.params[currentPreset.id]
@@ -1008,12 +1068,14 @@ function Content() {
                 ? `No filter. Active app saves it for ${runningApp.name}'s next launch; System-wide filters everything now.`
                 : "No filter. Start a game to use Active app, or use System-wide for the whole screen.";
     const showHeavyDownload = currentPreset?.heavy && !status.heavy_installed;
-    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { title: "CRT filter", children: [!status.reshade_supported && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "Gamescope ReShade support not detected. Shaders can't be applied on this system." }) })), SP_JSX.jsx(DFL.DropdownItem, { label: "Filter mode", description: modeDescription, rgOptions: modeOptions, selectedOption: modeOptions.find((o) => o.data === filterMode) ?? modeOptions[0], disabled: busy || !status.reshade_supported, onChange: (opt) => handleModeChange(opt.data) }), SP_JSX.jsx(DFL.DropdownItem, { label: "Preset", rgOptions: presetOptions, selectedOption: presetOptions.find((o) => o.data === status.preset_id) ??
-                            presetOptions[0], onChange: (opt) => handlePreset(opt.data) }), currentPreset && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: currentPreset.description }) })), showHeavyDownload && (SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: handleDownloadHeavy, disabled: busy, children: busy ? "Downloading…" : "Download CRT-Royale (heavy)" })), currentPreset?.params
+    return (SP_JSX.jsxs(SP_JSX.Fragment, { children: [SP_JSX.jsxs(DFL.PanelSection, { title: "CRT filter", children: [!status.reshade_supported && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "Gamescope ReShade support not detected. Shaders can't be applied on this system." }) })), SP_JSX.jsx(DFL.DropdownItem, { label: "Filter mode", description: modeReadable
+                            ? modeDescription
+                            : "Couldn't read Gamescope's current filter state; changes are disabled.", rgOptions: modeOptions, selectedOption: modeOptions.find((o) => o.data === filterMode) ?? modeOptions[0], disabled: busy || !status.reshade_supported || !modeReadable, onChange: (opt) => handleModeChange(opt.data) }), SP_JSX.jsx(DFL.DropdownItem, { label: "Preset", rgOptions: presetOptions, selectedOption: presetOptions.find((o) => o.data === status.preset_id) ??
+                            presetOptions[0], disabled: busy, onChange: (opt) => handlePreset(opt.data) }), currentPreset && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: currentPreset.description }) })), showHeavyDownload && (SP_JSX.jsx(DFL.ButtonItem, { layout: "below", onClick: handleDownloadHeavy, disabled: busy, children: busy ? "Downloading…" : "Download CRT-Royale (heavy)" })), currentPreset?.params
                         ? currentPreset.params
                             .filter(paramIsUsable)
                             .slice(0, 12)
-                            .map((param) => (SP_JSX.jsx(DFL.SliderField, { label: param.label, min: param.min, max: param.max, step: param.step, value: sliderValue(param, currentParams[param.key]), onChange: (v) => handleSlider(status.preset_id, param.key, v) }, param.key)))
+                            .map((param) => (SP_JSX.jsx(DFL.SliderField, { label: param.label, min: param.min, max: param.max, step: param.step, value: sliderValue(param, currentParams[param.key]), disabled: busy, onChange: (v) => handleSlider(status.preset_id, param.key, v) }, param.key)))
                         : null, filterMode === "app" && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "Slider changes rewrite the shader file; a game that is already running keeps its compiled copy until it restarts." }) }))] }), managedCount > 0 && (SP_JSX.jsxs(DFL.PanelSection, { title: "Saved per-game filters", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.85 }, children: managedNames }) }), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: "These games start under Gamescope with the selected preset. Removing the wrappers restores each game's original launch options. A game that is already running keeps its filter until it restarts." }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: handleRemoveWrappers, children: busy ? "Working…" : "Remove saved wrappers" })] })), !caps?.canWriteLaunchOptions && (SP_JSX.jsx(DFL.PanelSection, { title: "Steam integration", children: SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { children: "This Steam build doesn't expose launch-option editing, so active-app mode is unavailable. System-wide mode still works." }) }) })), SP_JSX.jsxs(DFL.PanelSection, { title: "Community packs", children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.85em", opacity: 0.8 }, children: "Curated shader collections from the community. Experimental \u2014 some shaders may not compile on your Gamescope build, and a community shader under the per-game wrapper is the least tested combination here. New presets appear in the list above after downloading." }) }), status.community_packs.map((pack) => (SP_JSX.jsxs("div", { children: [SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "0.9em" }, children: [SP_JSX.jsx("div", { children: pack.name }), SP_JSX.jsx("div", { style: { opacity: 0.7, fontSize: "0.9em" }, children: pack.description })] }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: () => pack.installed
                                     ? handleRemovePack(pack.id)
                                     : handleDownloadPack(pack.id), children: busy

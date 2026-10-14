@@ -38,7 +38,8 @@ export interface StatusInfo {
   displays: string[];
   shaders_installed: boolean;
   heavy_installed: boolean;
-  global_enabled: boolean;
+  /** null means the Gamescope property could not be read; never guess Off. */
+  global_enabled: boolean | null;
   preset_id: string;
   params: Record<string, Record<string, number>>;
   presets: Preset[];

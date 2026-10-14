@@ -757,7 +757,7 @@ class Plugin:
         m = re.search(r"AppId=(\d+)", cmdline)
         return int(m.group(1)) if m else None
 
-    def _wrapped_running_apps(self) -> list:
+    def _wrapped_running_apps(self) -> list | None:
         """Apps running RIGHT NOW under our nested gamescope.
 
         This is how the panel can tell "the per-game filter is live in this
@@ -768,9 +768,14 @@ class Plugin:
         found = set()
         try:
             p = subprocess.run(["ps", "-eo", "args"], capture_output=True,
-                               text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return []
+                               text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            decky.logger.error("DeckyCRT: wrapped-app probe failed: %s", e)
+            return None
+        if p.returncode != 0:
+            decky.logger.error("DeckyCRT: wrapped-app probe exited %s: %s",
+                               p.returncode, (p.stderr or "")[:200])
+            return None
         for line in p.stdout.splitlines():
             app_id = self._wrapper_appid_from_cmdline(line)
             if app_id is not None:
@@ -778,7 +783,12 @@ class Plugin:
         return sorted(found)
 
     async def wrapped_running_apps(self) -> dict:
-        return {"ok": True, "app_ids": self._wrapped_running_apps()}
+        app_ids = self._wrapped_running_apps()
+        if app_ids is None:
+            return {"ok": False,
+                    "detail": "Could not determine whether a wrapped game is running.",
+                    "app_ids": []}
+        return {"ok": True, "app_ids": app_ids}
 
     def _gamescope_core_pids(self, since: str) -> list:
         if not shutil.which("coredumpctl"):
@@ -897,6 +907,7 @@ class Plugin:
     # ------------------------------------------------------------------ status
     async def get_status(self) -> dict:
         cfg = self._load_config()
+        live_effect = self._live_global_effect()
         presets = []
         for p in PRESETS:
             entry = dict(p)
@@ -917,7 +928,7 @@ class Plugin:
             "displays": self._x11_displays(),
             "shaders_installed": shaders_installed,
             "heavy_installed": bool(cfg.get("heavy_relpath")),
-            "global_enabled": self._live_global_enabled(cfg),
+            "global_enabled": (None if live_effect is None else bool(live_effect)),
             "preset_id": cfg.get("preset_id", "aperture-grille"),
             "params": cfg.get("params", {}),
             "presets": presets,
@@ -1030,9 +1041,6 @@ class Plugin:
                 return effect
         return None
 
-    def _live_global_enabled(self, cfg: dict) -> bool:
-        """Compatibility view; use _live_global_effect for state transitions."""
-        return bool(self._live_global_effect())
 
     async def _read_effect_until(self, expected: str, displays: list) -> tuple[bool, str]:
         """Poll readback: xprop's write can precede Gamescope's render tick."""
