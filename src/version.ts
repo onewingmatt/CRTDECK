@@ -9,4 +9,4 @@
  *
  * Bump it whenever a change needs to be confirmed on the device.
  */
-export const PLUGIN_BUILD = "0.4.0-crashguard";
+export const PLUGIN_BUILD = "0.4.1-modesync";

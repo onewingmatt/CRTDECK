@@ -288,6 +288,11 @@ DEFAULT_CONFIG = {
 
 
 class Plugin:
+    def __init__(self):
+        # A toggle and a shader reapply must not race on Gamescope's one effect
+        # property. This is per backend instance and local to this plugin.
+        self._effect_lock = asyncio.Lock()
+
     # ------------------------------------------------------------------ paths
     @property
     def _home(self) -> str:
@@ -995,18 +1000,128 @@ class Plugin:
                 found.append(display)
         return found
 
-    def _live_global_enabled(self, cfg: dict) -> bool:
-        """Report the session's real state, not just what we last wrote.
-
-        Gamescope resets the property to empty when the session restarts, so
-        the stored flag alone can claim CRT is on while the screen is clean.
-        """
-        for display in self._gamescope_displays():
+    def _live_global_effect(self) -> str | None:
+        """Return the exact live effect path; None means the read failed."""
+        displays = self._gamescope_displays()
+        if not displays:
+            return None
+        saw_read = False
+        for display in displays:
             rc, out = self._xprop(display, "-notype",
                                   "GAMESCOPE_RESHADE_EFFECT")
-            if rc == 0 and ".fx" in out:
-                return True
-        return False
+            if rc != 0:
+                continue
+            saw_read = True
+            if "not found" in out:
+                return ""
+            match = re.search(
+                r'GAMESCOPE_RESHADE_EFFECT\([^)]*\)\s*=\s*"([^"]*)"',
+                out)
+            if match:
+                return match.group(1)
+            # Some xprop builds omit the type spelling, but still return the
+            # property value; an explicitly empty property is a valid Off.
+            if ".fx" not in out:
+                return ""
+        return "" if saw_read else None
+
+    def _live_global_enabled(self, cfg: dict) -> bool:
+        """Compatibility view; use _live_global_effect for state transitions."""
+        return bool(self._live_global_effect())
+
+    async def _read_effect_until(self, expected: str, displays: list) -> tuple[bool, str]:
+        """Poll readback: xprop's write can precede Gamescope's render tick."""
+        last = ""
+        for attempt in range(16):
+            unreadable = True
+            for display in displays:
+                rc, out = self._xprop(display, "-notype",
+                                      "GAMESCOPE_RESHADE_EFFECT")
+                if rc != 0:
+                    last = out
+                    continue
+                unreadable = False
+                if "not found" in out:
+                    observed = ""
+                else:
+                    match = re.search(
+                        r'GAMESCOPE_RESHADE_EFFECT\([^)]*\)\s*=\s*"([^"]*)"',
+                        out)
+                    if match:
+                        observed = match.group(1)
+                    elif ".fx" not in out:
+                        observed = ""
+                    else:
+                        last = out
+                        continue
+                if observed == expected:
+                    return True, display
+                last = f"{display}: still {observed!r}"
+            if attempt < 15 and not unreadable:
+                await asyncio.sleep(0.125)
+        return False, last
+
+    async def _set_global_enabled_locked(self, enabled: bool) -> dict:
+        """Write + read back while caller holds _effect_lock."""
+        cfg = self._load_config()
+        preset = self._preset_by_id(cfg.get("preset_id", "aperture-grille"),
+                                    cfg)
+        relpath = self._resolve_relpath(preset, cfg) if preset else ""
+        if enabled and not relpath:
+            return {"ok": False, "detail": "No shader installed for this preset."}
+        if shutil.which("xprop") is None:
+            return {"ok": False,
+                    "detail": "xprop is not installed; global mode unavailable."}
+        displays = self._gamescope_displays()
+        if not displays:
+            return {"ok": False,
+                    "detail": "No Gamescope display reachable over xprop."}
+        expected = relpath if enabled else ""
+        last_error = ""
+        for display in displays:
+            rc, output = self._xprop(
+                display, "-f", "GAMESCOPE_RESHADE_EFFECT", "8s", "-set",
+                "GAMESCOPE_RESHADE_EFFECT", expected)
+            if rc != 0:
+                last_error = output
+                continue
+            matched, observed = await self._read_effect_until(expected, displays)
+            if not matched:
+                last_error = observed
+                continue
+            cfg["global_enabled"] = enabled
+            self._save_config(cfg)
+            state = "enabled" if enabled else "disabled"
+            decky.logger.info("DeckyCRT: global CRT %s on %s", state, observed)
+            return {"ok": True,
+                    "detail": f"Global CRT {state} (display {observed})."}
+        return {"ok": False,
+                "detail": f"Could not verify Gamescope effect change: {last_error[:200]}"}
+
+    async def _set_global_enabled_impl(self, enabled: bool) -> dict:
+        """Serialize and make repeated mode events idempotent."""
+        async with self._effect_lock:
+            current = self._live_global_effect()
+            if current is None:
+                return {"ok": False,
+                        "detail": "Could not read the live Gamescope effect; no change made."}
+            cfg = self._load_config()
+            preset = self._preset_by_id(cfg.get("preset_id", "aperture-grille"),
+                                        cfg)
+            relpath = self._resolve_relpath(preset, cfg) if preset else ""
+            target = relpath if enabled else ""
+            if enabled and not target:
+                return {"ok": False,
+                        "detail": "No shader installed for this preset."}
+            if current == target:
+                cfg["global_enabled"] = enabled
+                self._save_config(cfg)
+                state = "enabled" if enabled else "disabled"
+                return {"ok": True, "detail": f"Global CRT already {state}."}
+            return await self._set_global_enabled_locked(enabled)
+
+    async def set_global_enabled(self, enabled: bool) -> dict:
+        return await self._set_global_enabled_impl(enabled)
 
     def _xprop_available(self) -> bool:
         return (shutil.which("xprop") is not None
@@ -1014,123 +1129,109 @@ class Plugin:
 
     # ------------------------------------------------------------------ apply
     async def set_preset(self, preset_id: str) -> dict:
-        cfg = self._load_config()
-        preset = self._preset_by_id(preset_id, cfg)
-        if not preset:
-            return {"ok": False, "detail": "unknown preset"}
-        if preset["heavy"] and not cfg.get("heavy_relpath"):
-            return {"ok": False,
-                    "detail": "Heavy shaders not downloaded yet."}
-        cfg["preset_id"] = preset_id
-        self._save_config(cfg)
-        detail = f"Preset: {preset['name']}"
-        if cfg.get("global_enabled"):
-            res = await self.set_global_enabled(True)
-            detail += " — " + res.get("detail", "")
-        return {"ok": True, "detail": detail}
+        async with self._effect_lock:
+            cfg = self._load_config()
+            preset = self._preset_by_id(preset_id, cfg)
+            if not preset:
+                return {"ok": False, "detail": "unknown preset"}
+            if preset["heavy"] and not cfg.get("heavy_relpath"):
+                return {"ok": False,
+                        "detail": "Heavy shaders not downloaded yet."}
+            # Read what is actually on screen: a stale stored flag would
+            # re-apply a filter the user already switched off.
+            live = self._live_global_effect()
+            if live is None:
+                return {"ok": False,
+                        "detail": "Could not read the live Gamescope effect; preset not changed."}
+            cfg["preset_id"] = preset_id
+            self._save_config(cfg)
+            detail = f"Preset: {preset['name']}"
+            if live:
+                res = await self._set_global_enabled_locked(True)
+                if not res.get("ok"):
+                    return {"ok": False,
+                            "detail": detail + " — reapply failed: "
+                                      + res.get("detail", "")}
+                detail += " — " + res.get("detail", "")
+            return {"ok": True, "detail": detail}
 
     async def set_param(self, preset_id: str, key: str, value: float,
                         reapply: bool = True) -> dict:
         """Bake a slider value into the shader's uniform initializer."""
-        cfg = self._load_config()
-        preset = self._preset_by_id(preset_id, cfg)
-        if not preset or preset["heavy"]:
-            return {"ok": False, "detail": "preset has no tunable params"}
-        if key not in {p["key"] for p in preset.get("params", [])}:
-            return {"ok": False, "detail": f"param {key} not found"}
-        # Validate before touching the file: a NaN or an out-of-range value
-        # must never be baked into a shader.
-        spec = next((p for p in preset.get("params", []) if p["key"] == key),
-                    None)
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return {"ok": False, "detail": f"invalid value for {key}"}
-        if not math.isfinite(value):
-            return {"ok": False, "detail": f"invalid value for {key}"}
-        if spec:
-            lo, hi = spec.get("min"), spec.get("max")
-            if (isinstance(lo, (int, float)) and isinstance(hi, (int, float))
-                    and hi > lo):
-                value = min(max(value, lo), hi)
-        if preset.get("community"):
-            # Community shaders are baked in place (no pristine template).
-            template = target = os.path.join(self._shader_base,
-                                             preset["relpath"])
-        else:
-            template = os.path.join(self._plugin_dir, "shaders",
-                                    os.path.basename(preset["file"]))
-            if not os.path.isfile(template):
-                template = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "shaders", os.path.basename(preset["file"]))
-            target = os.path.join(self._shader_base, preset["file"])
-        try:
-            with open(template, "r", encoding="utf-8") as f:
-                text = f.read()
-            pattern = (r"(uniform\s+float\s+" + re.escape(key)
-                       + r"\s*(?:<[^>]*>)?\s*=\s*)[-+0-9.eE]+")
-            new_text, n = re.subn(pattern, r"\g<1>" + f"{value:.4f}", text,
-                                  count=1)
-            if n == 0:
+        async with self._effect_lock:
+            cfg = self._load_config()
+            preset = self._preset_by_id(preset_id, cfg)
+            if not preset or preset["heavy"]:
+                return {"ok": False, "detail": "preset has no tunable params"}
+            if key not in {p["key"] for p in preset.get("params", [])}:
                 return {"ok": False, "detail": f"param {key} not found"}
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with open(target, "w", encoding="utf-8") as f:
-                f.write(new_text)
-        except OSError as e:
-            return {"ok": False, "detail": str(e)[:200]}
+            # Validate before touching the file: a NaN or an out-of-range value
+            # must never be baked into a shader.
+            spec = next((p for p in preset.get("params", []) if p["key"] == key),
+                        None)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return {"ok": False, "detail": f"invalid value for {key}"}
+            if not math.isfinite(value):
+                return {"ok": False, "detail": f"invalid value for {key}"}
+            if spec:
+                lo, hi = spec.get("min"), spec.get("max")
+                if (isinstance(lo, (int, float)) and isinstance(hi, (int, float))
+                        and hi > lo):
+                    value = min(max(value, lo), hi)
+            if preset.get("community"):
+                # Community shaders are baked in place (no pristine template).
+                template = target = os.path.join(self._shader_base,
+                                                 preset["relpath"])
+            else:
+                template = os.path.join(self._plugin_dir, "shaders",
+                                        os.path.basename(preset["file"]))
+                if not os.path.isfile(template):
+                    template = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "shaders", os.path.basename(preset["file"]))
+                target = os.path.join(self._shader_base, preset["file"])
+            try:
+                with open(template, "r", encoding="utf-8") as f:
+                    text = f.read()
+                pattern = (r"(uniform\s+float\s+" + re.escape(key)
+                           + r"\s*(?:<[^>]*>)?\s*=\s*)[-+0-9.eE]+")
+                new_text, n = re.subn(pattern, r"\g<1>" + f"{value:.4f}", text,
+                                      count=1)
+                if n == 0:
+                    return {"ok": False, "detail": f"param {key} not found"}
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+            except OSError as e:
+                return {"ok": False, "detail": str(e)[:200]}
 
-        cfg.setdefault("params", {}).setdefault(preset_id, {})[key] = value
-        self._save_config(cfg)
+            cfg.setdefault("params", {}).setdefault(preset_id, {})[key] = value
+            self._save_config(cfg)
 
-        detail = f"{key} = {value:.2f}"
-        if reapply and cfg.get("global_enabled"):
-            # Force the session compositor to recompile the edited shader.
-            await self.set_global_enabled(False)
-            res = await self.set_global_enabled(True)
-            detail += " — " + res.get("detail", "")
-        return {"ok": True, "detail": detail}
-
-    async def set_global_enabled(self, enabled: bool) -> dict:
-        """Toggle the whole-screen shader on the running Gamescope session."""
-        cfg = self._load_config()
-        preset = self._preset_by_id(cfg.get("preset_id", "aperture-grille"),
-                                    cfg)
-        relpath = self._resolve_relpath(preset, cfg) if preset else ""
-        if enabled and not relpath:
-            return {"ok": False,
-                    "detail": "No shader installed for this preset."}
-        if shutil.which("xprop") is None:
-            return {"ok": False,
-                    "detail": "xprop is not installed; global mode unavailable."}
-        displays = self._gamescope_displays()
-        if not displays:
-            return {"ok": False,
-                    "detail": "No Gamescope display reachable over xprop — "
-                              "global mode needs xprop plus a Gamescope "
-                              "session."}
-
-        value = relpath if enabled else ""
-        last_err = ""
-        for display in displays:
-            rc, out = self._xprop(display, "-f", "GAMESCOPE_RESHADE_EFFECT",
-                                  "8s", "-set", "GAMESCOPE_RESHADE_EFFECT",
-                                  value)
-            if rc != 0:
-                last_err = out
-                continue
-            rc2, out2 = self._xprop(display, "GAMESCOPE_RESHADE_EFFECT")
-            if rc2 == 0 and (value in out2 or (not value and ".fx" not in out2)):
-                cfg["global_enabled"] = enabled
-                self._save_config(cfg)
-                state = "enabled" if enabled else "disabled"
-                decky.logger.info("DeckyCRT: global CRT %s on %s", state,
-                                  display)
-                return {"ok": True,
-                        "detail": f"Global CRT {state} (display {display})."}
-            last_err = out2
-        return {"ok": False,
-                "detail": f"Could not set session effect: {last_err[:200]}"}
+            detail = f"{key} = {value:.2f}"
+            if reapply:
+                # Only recompile if the effect is live right now. A slider event
+                # queued before Off must not turn the filter back on.
+                live = self._live_global_effect()
+                if live is None:
+                    return {"ok": False,
+                            "detail": detail + " — could not read live effect; "
+                                      "slider saved without reapply."}
+                if live:
+                    off = await self._set_global_enabled_locked(False)
+                    if not off.get("ok"):
+                        return {"ok": False,
+                                "detail": detail + " — disable for reapply failed: "
+                                          + off.get("detail", "")}
+                    res = await self._set_global_enabled_locked(True)
+                    if not res.get("ok"):
+                        return {"ok": False,
+                                "detail": detail + " — reapply failed: "
+                                          + res.get("detail", "")}
+                    detail += " — " + res.get("detail", "")
+            return {"ok": True, "detail": detail}
 
     # ------------------------------------------------------------------ hooks
     async def _main(self):

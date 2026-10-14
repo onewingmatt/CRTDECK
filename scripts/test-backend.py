@@ -136,6 +136,90 @@ def main():
     check("clear_managed_apps empties the registry",
           (run(plugin.clear_managed_apps()), run(plugin.get_status())["managed_apps"])[1], {})
 
+    print("backend: global-effect transitions")
+    # xprop's write only becomes visible after Gamescope's next render tick, so a
+    # single immediate readback makes a successful toggle look like a no-op and
+    # invites the second press that stacks a filter. These stubs model that lag.
+    saved = {
+        "displays": plugin._gamescope_displays,
+        "xprop": plugin._xprop,
+        "which": mod.shutil.which,
+        "sleep": mod.asyncio.sleep,
+        "preset": plugin._preset_by_id,
+        "resolve": plugin._resolve_relpath,
+    }
+    writes = []
+    live = {"value": "", "stale": 1, "readable": True}
+
+    def fake_xprop(display, *args):
+        if "-set" in args:
+            writes.append(args[-1])
+            live["value"] = args[-1]
+            live["stale"] = 1
+            return 0, ""
+        if args[-1] == "GAMESCOPE_RESHADE_EFFECT":
+            if not live["readable"]:
+                return 1, "xprop: unable to open display :0"
+            stale, live["stale"] = live["stale"], max(0, live["stale"] - 1)
+            shown = "" if stale > 0 else live["value"]
+            return 0, f'GAMESCOPE_RESHADE_EFFECT(STRING) = "{shown}"'
+        return 0, ""
+
+    async def no_wait(_seconds):
+        return None
+
+    try:
+        plugin._gamescope_displays = lambda: [":0"]
+        plugin._xprop = fake_xprop
+        plugin._preset_by_id = lambda pid, cfg: {
+            "id": pid, "name": "Test CRT", "heavy": False, "relpath": "",
+            "file": "", "params": []}
+        plugin._resolve_relpath = lambda preset, cfg: "deckycrt/crt.fx"
+        mod.shutil.which = (lambda name: "/usr/bin/xprop"
+                            if name == "xprop" else None)
+        mod.asyncio.sleep = no_wait
+
+        res = run(plugin.set_global_enabled(True))
+        check("enable survives a stale first read", res["ok"], True)
+        check("enable records confirmed live state",
+              plugin._load_config()["global_enabled"], True)
+        check("enable writes the property once", len(writes), 1)
+
+        res = run(plugin.set_global_enabled(True))
+        check("repeating the same mode is idempotent", res["ok"], True)
+        check("repeat does not re-write the property", len(writes), 1)
+
+        res = run(plugin.set_global_enabled(False))
+        check("disable survives a stale first read", res["ok"], True)
+        check("disable records confirmed off state",
+              plugin._load_config()["global_enabled"], False)
+        check("disable writes an empty property", writes[-1], "")
+
+        res = run(plugin.set_global_enabled(False))
+        check("repeating Off is idempotent", res["ok"], True)
+        check("repeat Off does not re-write", len(writes), 2)
+
+        # An unreadable property must fail closed: never guess and write.
+        live["readable"] = False
+        before = list(writes)
+        res = run(plugin.set_global_enabled(True))
+        check("unreadable live state refuses the change", res["ok"], False)
+        check("unreadable live state writes nothing", writes, before)
+        live["readable"] = True
+
+        # A slider event queued while Off must not resurrect the filter.
+        before = list(writes)
+        res = run(plugin.set_param("aperture-grille", "scanline", 0.5,
+                                   reapply=True))
+        check("slider while Off writes no property", writes, before)
+    finally:
+        plugin._gamescope_displays = saved["displays"]
+        plugin._xprop = saved["xprop"]
+        plugin._preset_by_id = saved["preset"]
+        plugin._resolve_relpath = saved["resolve"]
+        mod.shutil.which = saved["which"]
+        mod.asyncio.sleep = saved["sleep"]
+
     print("backend: crash detection parsers")
     # The real coredumpctl rows and command line that this was written against:
     # the per-game wrapper that took gamescope down when Risk of Rain Returns

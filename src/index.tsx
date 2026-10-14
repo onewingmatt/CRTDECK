@@ -272,26 +272,30 @@ function Content() {
     // rendered `busy=true`; guard synchronously so a fast double-press cannot
     // interleave enable/disable writes to Gamescope's property.
     if (modeBusyRef.current || busy || !status) return;
+    modeBusyRef.current = true;
+    setBusy(true);
     const managed = status.managed_apps ?? {};
+    const rel = shaderPathFor(status);
     const current = modeOf(
       status.global_enabled,
       runningWrapper !== null || Object.keys(managed).length > 0
     );
-    if (mode === current) return;
-    modeBusyRef.current = true;
-    setBusy(true);
-    const rel = shaderPathFor(status);
     diag(
       `mode ${current} -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`
     );
     try {
+      // No early return when mode === current. The panel's idea of the current
+      // mode comes from the last completed probe and can lag the session, so
+      // refusing here is how a real press turns into a silent no-op. Every
+      // branch below is idempotent and always reports its result.
       if (mode === "off") {
         const cleared = await clearAppScope(rel);
         let detail = "CRT filter off.";
-        if (status.global_enabled) {
-          const res = await setGlobalEnabled(false);
-          detail = res.ok ? "CRT filter off." : res.detail;
-        }
+        // Always ask for off instead of trusting the panel's copy of the flag:
+        // the backend verifies the live property and answers idempotently, so
+        // a stale "already off" here would leave a live filter running.
+        const res = await setGlobalEnabled(false);
+        if (!res.ok) detail = res.detail;
         if (!cleared) {
           detail +=
             " Some saved per-game wrappers could not be read or cleared — see the plugin log.";
@@ -302,13 +306,19 @@ function Content() {
         // filtering for the life of that process: system-wide would filter the
         // same pixels a second time (double blur, double cost) and no launch
         // option can stop it. Refuse instead of stacking.
-        let live: number[] = [];
-        try {
-          const probe = await wrappedRunningApps();
-          if (probe?.ok) live = probe.app_ids ?? [];
-        } catch (e) {
-          toastError("Running-wrapper check", e);
+        //
+        // Fail closed: if the probe cannot answer, we do not know whether a
+        // wrapper is live, and guessing "none" is exactly what stacks the two
+        // passes. Refuse and say so.
+        const probe = await wrappedRunningApps();
+        if (!probe?.ok) {
+          diag("system-wide refused: could not determine whether a wrapped game is running");
+          toast(
+            "Couldn't tell whether a game is already running its own CRT filter, so system-wide was not enabled. Close any running game and try again."
+          );
+          return;
         }
+        const live = probe.app_ids ?? [];
         if (live.length) {
           const names = live
             .map((id) => managed[String(id)]?.name ?? `App ${id}`)
@@ -337,12 +347,13 @@ function Content() {
           );
           return;
         }
-        if (status.global_enabled) {
-          const res = await setGlobalEnabled(false);
-          if (!res.ok) {
-            toast(res.detail);
-            return;
-          }
+        // Always disable the session-wide filter here, not just when the
+        // panel's flag says it is on. Leaving a live global pass running while
+        // also saving a per-game wrapper is the double-filter case.
+        const off = await setGlobalEnabled(false);
+        if (!off.ok) {
+          toast(off.detail);
+          return;
         }
         const ok = await applyWrapper(
           runningApp.appId,
@@ -360,8 +371,19 @@ function Content() {
     } catch (e) {
       toastError("Mode change", e);
     } finally {
-      await refresh();
-      await refreshRunningWrapper(runningApp);
+      // Both refreshes are best-effort, and both must be attempted. Calling
+      // them bare meant a rejected launch-option read skipped the guard reset
+      // and left modeBusyRef true, so every later press silently did nothing.
+      try {
+        await refresh();
+      } catch (e) {
+        toastError("Post-change status refresh", e);
+      }
+      try {
+        await refreshRunningWrapper(runningApp);
+      } catch (e) {
+        console.warn("DeckyCRT: post-change wrapper refresh failed", e);
+      }
       modeBusyRef.current = false;
       setBusy(false);
     }
