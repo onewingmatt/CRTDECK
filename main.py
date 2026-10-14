@@ -1000,30 +1000,35 @@ class Plugin:
                 found.append(display)
         return found
 
+    @staticmethod
+    def _parse_effect_property(output: str) -> tuple[bool, str]:
+        """Parse xprop output; distinguish empty from unreadable/unparseable."""
+        if "no such atom" in output.lower():
+            return True, ""
+        # xprop -notype emits `NAME = "/path.fx"`; typed xprop emits
+        # `NAME(STRING) = "/path.fx"`. Empty values appear as `NAME = ` or
+        # `NAME(STRING) = ` (sometimes with quotes).
+        match = re.search(
+            r'GAMESCOPE_RESHADE_EFFECT(?:\([^)]*\))?\s*=\s*(?:"([^"]*)")?\s*$',
+            output.strip(), re.IGNORECASE)
+        if match:
+            return True, match.group(1) or ""
+        return False, ""
+
     def _live_global_effect(self) -> str | None:
-        """Return the exact live effect path; None means the read failed."""
+        """Return the exact live effect path; None means unreadable."""
         displays = self._gamescope_displays()
         if not displays:
             return None
-        saw_read = False
         for display in displays:
-            rc, out = self._xprop(display, "-notype",
-                                  "GAMESCOPE_RESHADE_EFFECT")
+            rc, output = self._xprop(display, "-notype",
+                                     "GAMESCOPE_RESHADE_EFFECT")
             if rc != 0:
                 continue
-            saw_read = True
-            if "not found" in out:
-                return ""
-            match = re.search(
-                r'GAMESCOPE_RESHADE_EFFECT\([^)]*\)\s*=\s*"([^"]*)"',
-                out)
-            if match:
-                return match.group(1)
-            # Some xprop builds omit the type spelling, but still return the
-            # property value; an explicitly empty property is a valid Off.
-            if ".fx" not in out:
-                return ""
-        return "" if saw_read else None
+            readable, effect = self._parse_effect_property(output)
+            if readable:
+                return effect
+        return None
 
     def _live_global_enabled(self, cfg: dict) -> bool:
         """Compatibility view; use _live_global_effect for state transitions."""
@@ -1033,31 +1038,22 @@ class Plugin:
         """Poll readback: xprop's write can precede Gamescope's render tick."""
         last = ""
         for attempt in range(16):
-            unreadable = True
+            readable_any = False
             for display in displays:
-                rc, out = self._xprop(display, "-notype",
-                                      "GAMESCOPE_RESHADE_EFFECT")
+                rc, output = self._xprop(display, "-notype",
+                                         "GAMESCOPE_RESHADE_EFFECT")
                 if rc != 0:
-                    last = out
+                    last = output
                     continue
-                unreadable = False
-                if "not found" in out:
-                    observed = ""
-                else:
-                    match = re.search(
-                        r'GAMESCOPE_RESHADE_EFFECT\([^)]*\)\s*=\s*"([^"]*)"',
-                        out)
-                    if match:
-                        observed = match.group(1)
-                    elif ".fx" not in out:
-                        observed = ""
-                    else:
-                        last = out
-                        continue
+                readable, observed = self._parse_effect_property(output)
+                if not readable:
+                    last = f"{display}: unparseable property readback: {output}"
+                    continue
+                readable_any = True
                 if observed == expected:
                     return True, display
                 last = f"{display}: still {observed!r}"
-            if attempt < 15 and not unreadable:
+            if attempt < 15 and readable_any:
                 await asyncio.sleep(0.125)
         return False, last
 

@@ -136,6 +136,26 @@ def main():
     check("clear_managed_apps empties the registry",
           (run(plugin.clear_managed_apps()), run(plugin.get_status())["managed_apps"])[1], {})
 
+    print("backend: Gamescope property output parser")
+    parse = mod.Plugin._parse_effect_property
+    check("parses xprop -notype effect path",
+          parse('GAMESCOPE_RESHADE_EFFECT = "/path/to/crt.fx"'),
+          (True, "/path/to/crt.fx"))
+    check("parses typed effect path",
+          parse('GAMESCOPE_RESHADE_EFFECT(STRING) = "/path/to/crt.fx"'),
+          (True, "/path/to/crt.fx"))
+    check("parses empty xprop value without quotes",
+          parse("GAMESCOPE_RESHADE_EFFECT(STRING) = "), (True, ""))
+    check("parses empty xprop value with quotes",
+          parse('GAMESCOPE_RESHADE_EFFECT(STRING) = ""'), (True, ""))
+    check("recognizes absent X atom",
+          parse("GAMESCOPE_RESHADE_EFFECT:  no such atom on any window."),
+          (True, ""))
+    check("unknown output containing fx fails closed",
+          parse("unexpected .fx output"), (False, ""))
+    check("unrelated output fails closed", parse("xprop: unable to open display"),
+          (False, ""))
+
     print("backend: global-effect transitions")
     # xprop's write only becomes visible after Gamescope's next render tick, so a
     # single immediate readback makes a successful toggle look like a no-op and

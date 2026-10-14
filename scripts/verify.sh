@@ -33,7 +33,7 @@ FIRST=$(sha256sum dist/index.js | cut -d' ' -f1)
 echo "   dist/index.js $FIRST"
 
 echo "== bundle contents =="
-for sym in toastError sliderValue paramIsUsable installWrapper removeWrapper foreign-gamescope RegisterForAppDetails check_wrapper_crashes wrapped_running_apps 0.4.1-modesync; do
+for sym in toastError sliderValue paramIsUsable installWrapper removeWrapper foreign-gamescope RegisterForAppDetails check_wrapper_crashes wrapped_running_apps 0.4.2-effectparse; do
   grep -q "$sym" dist/index.js || { echo "   MISSING $sym in bundle" >&2; exit 1; }
   echo "   $sym present"
 done

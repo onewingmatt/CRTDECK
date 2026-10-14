@@ -503,7 +503,7 @@ async function writeLaunchOptions(appId, value) {
  *
  * Bump it whenever a change needs to be confirmed on the device.
  */
-const PLUGIN_BUILD = "0.4.1-modesync";
+const PLUGIN_BUILD = "0.4.2-effectparse";
 
 function toast(body) {
     toaster.toast({ title: "DeckyCRT", body });
