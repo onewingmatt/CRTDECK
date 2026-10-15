@@ -28,6 +28,8 @@ import {
   wrappedRunningApps,
 } from "./api";
 import { installWrapper, removeWrapper, wrapperPath } from "./launchOptions";
+import { describeApps, planModeChange, readMode } from "./mode";
+import type { FilterMode, ModeFacts, Step } from "./mode";
 import {
   Capabilities,
   RunningApp,
@@ -38,8 +40,6 @@ import {
   writeLaunchOptions,
 } from "./steam";
 import { PLUGIN_BUILD } from "./version";
-
-type FilterMode = "off" | "app" | "system";
 
 function toast(body: string) {
   toaster.toast({ title: "DeckyCRT", body });
@@ -88,18 +88,16 @@ function shaderPathFor(status: StatusInfo, presetId?: string): string {
   return status.presets.find((p) => p.id === id)?.relpath ?? "";
 }
 
-/** One source of truth for the mode: live state, never a stored flag. */
-function modeOf(globalEnabled: boolean, appScoped: boolean): FilterMode {
-  if (globalEnabled) return "system";
-  return appScoped ? "app" : "off";
-}
-
 function Content() {
   const [status, setStatus] = useState<StatusInfo | null>(null);
   const [runningApp, setRunningApp] = useState<RunningApp | null>(null);
   const [caps, setCaps] = useState<Capabilities | null>(null);
-  // null = the running game's options could not be read; do not guess "off".
-  const [runningWrapper, setRunningWrapper] = useState<string | null>(null);
+  // The foreground game's saved wrapper. `unreadable` stays distinct from
+  // `no-game`: collapsing them is how the panel guesses, and the guess is what
+  // puts two filters on one picture.
+  const [runningWrapper, setRunningWrapper] = useState<
+    { state: "no-game" } | { state: "unreadable" } | { state: "read"; path: string }
+  >({ state: "no-game" });
   const [busy, setBusy] = useState(false);
   const [recoveryRan, setRecoveryRan] = useState(false);
   const debounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
@@ -117,11 +115,15 @@ function Content() {
 
   const refreshRunningWrapper = async (app: RunningApp | null) => {
     if (!app) {
-      setRunningWrapper(null);
+      setRunningWrapper({ state: "no-game" });
       return;
     }
     const cur = await readLaunchOptions(app.appId);
-    setRunningWrapper(cur === null ? null : wrapperPath(cur));
+    setRunningWrapper(
+      cur === null
+        ? { state: "unreadable" }
+        : { state: "read", path: wrapperPath(cur) ?? "" }
+    );
     diag(
       `running app ${app.appId} (${app.name}) options ` +
         (cur === null ? "unreadable" : JSON.stringify(cur))
@@ -279,6 +281,99 @@ function Content() {
   // React's busy state update is asynchronous and cannot serialize rapid events.
   const modeBusyRef = useRef(false);
 
+  /**
+   * Everything the mode decision needs, gathered in one place.
+   *
+   * A `null` field means "could not be read", which is a different answer from
+   * "nothing there". Keeping them apart is the whole point: the old code
+   * guessed, and the guess is what stacks two filters on one picture.
+   */
+  const gatherModeFacts = async (): Promise<ModeFacts> => {
+    let liveWrapped: Array<{ appId: number; name?: string }> | null = null;
+    try {
+      const probe = await wrappedRunningApps();
+      liveWrapped = probe?.ok
+        ? (probe.app_ids ?? []).map((id) => ({
+            appId: id,
+            name: status?.managed_apps?.[String(id)]?.name,
+          }))
+        : null;
+    } catch (e) {
+      diag(`running-wrapper probe failed: ${String(e)}`);
+      liveWrapped = null;
+    }
+    return {
+      liveEffect: status?.live_effect ?? null,
+      runningApp: runningApp?.name ?? null,
+      runningWrapper:
+        runningWrapper.state === "read"
+          ? runningWrapper.path
+          : runningWrapper.state === "unreadable"
+            ? null
+            : "",
+      managedNames: Object.values(status?.managed_apps ?? {}).map((m) => m.name),
+      liveWrapped,
+    };
+  };
+
+  /** Run one planned step. A step that cannot be verified reports failure. */
+  const runModeStep = async (
+    step: Step,
+    rel: string
+  ): Promise<{ ok: boolean; detail: string }> => {
+    if (step.kind === "clearAppScope") {
+      const cleared = await clearAppScope(rel);
+      return {
+        ok: cleared,
+        detail: cleared
+          ? "Saved filters cleared."
+          : "Some saved per-game wrappers could not be read or cleared — see the plugin log.",
+      };
+    }
+    if (step.kind === "setGlobal") {
+      if (step.enabled) {
+        // Clearing the saved wrappers cannot stop a game that is already
+        // running under one, and that game would be filtered twice. Re-probe
+        // rather than trust the earlier reading.
+        const again = await gatherModeFacts();
+        if (again.liveWrapped === null) {
+          return {
+            ok: false,
+            detail:
+              "Could not re-check running games after cleanup; system-wide was not enabled.",
+          };
+        }
+        if (again.liveWrapped.length) {
+          return {
+            ok: false,
+            detail: `${describeApps(again.liveWrapped)} is already filtering until it exits. System-wide was not enabled.`,
+          };
+        }
+      }
+      const res = await setGlobalEnabled(step.enabled);
+      return { ok: res.ok, detail: res.detail };
+    }
+    if (step.kind === "wrapForeground") {
+      if (!runningApp) {
+        return { ok: false, detail: "No game is running." };
+      }
+      const ok = await applyWrapper(
+        runningApp.appId,
+        runningApp.name,
+        true,
+        rel,
+        status?.managed_apps?.[String(runningApp.appId)]
+      );
+      return {
+        ok,
+        detail: ok
+          ? `Saved for ${runningApp.name}. It applies the next time that game starts.`
+          : `Couldn't save launch options for ${runningApp.name} — nothing changed. See the plugin log.`,
+      };
+    }
+    return { ok: false, detail: "Unknown step." };
+  };
+
   const handleModeChange = async (mode: FilterMode) => {
     // Decky's dropdown can deliver repeated activation events before React has
     // rendered `busy=true`; guard synchronously so a fast double-press cannot
@@ -286,134 +381,41 @@ function Content() {
     if (modeBusyRef.current || busy || !status) return;
     modeBusyRef.current = true;
     setBusy(true);
-    const managed = status.managed_apps ?? {};
     const rel = shaderPathFor(status);
-    const current =
-      status.global_enabled === null
-        ? "unknown"
-        : modeOf(
-            status.global_enabled,
-            runningWrapper !== null || Object.keys(managed).length > 0
-          );
-    diag(
-      `mode ${current} -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`
-    );
     try {
-      // No early return when mode === current. The panel's idea of the current
-      // mode comes from the last completed probe and can lag the session, so
-      // refusing here is how a real press turns into a silent no-op. Every
-      // branch below is idempotent and always reports its result.
-      if (mode === "off") {
-        let liveGames: Awaited<ReturnType<typeof wrappedRunningApps>> | null = null;
-        try {
-          liveGames = await wrappedRunningApps();
-        } catch (e) {
-          diag(`Off: running-wrapper probe failed: ${String(e)}`);
-        }
-        // A failed diagnostic probe must not block cleanup/disable.
-        const cleared = await clearAppScope(rel);
-        // If the Gamescope property is unreadable, still remove persistent
-        // per-game launch wrappers, but cannot promise the global layer is off.
-        const globalResult = await setGlobalEnabled(false);
-        let detail = globalResult.ok ? "Saved filters cleared; system filter is off." : globalResult.detail;
-        if (liveGames?.ok && (liveGames.app_ids ?? []).length) {
-          const names = liveGames.app_ids
-            .map((id) => managed[String(id)]?.name ?? `App ${id}`)
-            .join(", ");
-          detail += ` ${names} is already running under its saved filter; that process keeps filtering until it exits.`;
-        } else if (!liveGames?.ok) {
-          detail += " Could not check whether a game is still running under its own filter.";
-        }
-        if (!cleared) {
-          detail +=
-            " Some saved per-game wrappers could not be read or cleared — see the plugin log.";
-        }
-        toast(detail);
-      } else if (status.global_enabled === null) {
-        toast("Couldn't read Gamescope's live filter state, so no mode change was made.");
+      // Decide, then do. The decision (including every refusal) belongs to
+      // src/mode.ts, which both languages used to duplicate.
+      const facts = await gatherModeFacts();
+      const change = planModeChange(mode, facts);
+      diag(
+        `mode change -> ${mode} (preset ${status.preset_id}, shader ${rel || "none"})`
+      );
+      if (change.kind === "refuse") {
+        diag(`mode change refused: ${change.detail}`);
+        toast(change.detail);
         return;
-      } else if (mode === "system") {
-        // A game already running under its own wrapped gamescope keeps
-        // filtering for the life of that process: system-wide would filter the
-        // same pixels a second time (double blur, double cost) and no launch
-        // option can stop it. Refuse instead of stacking.
-        //
-        // Fail closed: if the probe cannot answer, we do not know whether a
-        // wrapper is live, and guessing "none" is exactly what stacks the two
-        // passes. Refuse and say so.
-        const probe = await wrappedRunningApps();
-        if (!probe?.ok) {
-          diag("system-wide refused: could not determine whether a wrapped game is running");
-          toast(
-            "Couldn't tell whether a game is already running its own CRT filter, so system-wide was not enabled. Close any running game and try again."
-          );
-          return;
-        }
-        const live = probe.app_ids ?? [];
-        if (live.length) {
-          const names = live
-            .map((id) => managed[String(id)]?.name ?? `App ${id}`)
-            .join(", ");
-          diag(`system-wide refused: ${names} is running under our wrapper`);
-          toast(
-            `${names} is already running under its own CRT, and both would filter the same picture (double blur). Close that game first, or set the filter to Off.`
-          );
-          return;
-        }
-        const cleared = await clearAppScope(rel);
-        if (!cleared) {
-          toast(
-            "Couldn't clear every saved per-game wrapper, so system-wide was not enabled — they must not stack."
-          );
-          return;
-        }
-        // clearAppScope removes launch-option wrappers; an already-running
-        // nested Gamescope remains active until that game exits. Re-probe after
-        // cleanup so a race with game launch cannot stack global filtering.
-        const afterCleanup = await wrappedRunningApps();
-        if (!afterCleanup?.ok) {
-          toast("Could not re-check running games after cleanup; system-wide was not enabled.");
-          return;
-        }
-        if ((afterCleanup.app_ids ?? []).length) {
-          const names = afterCleanup.app_ids
-            .map((id) => managed[String(id)]?.name ?? `App ${id}`)
-            .join(", ");
-          toast(`${names} is already filtering until it exits. System-wide was not enabled.`);
-          return;
-        }
-        const res = await setGlobalEnabled(true);
-        toast(res.detail);
-      } else {
-        // Active app: the wrapper lives in that game's saved launch options.
-        // It cannot filter a game that is already running.
-        if (!runningApp) {
-          toast(
-            "Start a game first — active-app mode saves the filter in that game's launch options."
-          );
-          return;
-        }
-        // Always disable the session-wide filter here, not just when the
-        // panel's flag says it is on. Leaving a live global pass running while
-        // also saving a per-game wrapper is the double-filter case.
-        const off = await setGlobalEnabled(false);
-        if (!off.ok) {
-          toast(off.detail);
-          return;
-        }
-        const ok = await applyWrapper(
-          runningApp.appId,
-          runningApp.name,
-          true,
-          rel,
-          managed[String(runningApp.appId)]
-        );
-        toast(
-          ok
-            ? `Saved for ${runningApp.name}. It applies the next time that game starts.`
-            : `Couldn't save launch options for ${runningApp.name} — nothing changed. See the plugin log.`
-        );
       }
+      let detail = "";
+      for (const step of change.steps) {
+        const res = await runModeStep(step, rel);
+        detail = res.detail;
+        if (!res.ok) {
+          diag(`mode change stopped at ${step.kind}: ${res.detail}`);
+          toast(res.detail);
+          return;
+        }
+      }
+      if (mode === "off") {
+        // A game already running under its own wrapper keeps filtering until
+        // it exits, and no launch option can change that. Say so.
+        if (facts.liveWrapped === null) {
+          detail +=
+            " Could not check whether a game is still running under its own filter.";
+        } else if (facts.liveWrapped.length) {
+          detail += ` ${describeApps(facts.liveWrapped)} is still running under its saved filter and keeps filtering until it exits.`;
+        }
+      }
+      toast(detail);
     } catch (e) {
       toastError("Mode change", e);
     } finally {
@@ -628,12 +630,21 @@ function Content() {
   const managed = status.managed_apps ?? {};
   const managedEntries = Object.entries(managed);
   const managedCount = managedEntries.length;
-  const appScoped = runningWrapper !== null || managedCount > 0;
-  const filterMode =
-    status.global_enabled === null
-      ? "off"
-      : modeOf(status.global_enabled, appScoped);
-  const modeReadable = status.global_enabled !== null;
+  // One owner for the reading. `mode.ts` decides what the state is, including
+  // when the honest answer is "unknown" rather than a guess at "off".
+  const reading = readMode({
+    liveEffect: status.live_effect,
+    runningApp: runningApp?.name ?? null,
+    runningWrapper:
+      runningWrapper.state === "read"
+        ? runningWrapper.path
+        : runningWrapper.state === "unreadable"
+          ? null
+          : "",
+    managedNames: managedEntries.map(([, info]) => info.name),
+    liveWrapped: [],
+  });
+  const filterMode = reading.mode;
   const currentPreset = status.presets.find((p) => p.id === status.preset_id);
   const currentParams =
     currentPreset && status.params[currentPreset.id]
@@ -651,19 +662,27 @@ function Content() {
     },
     { data: "system", label: "System-wide" },
   ];
+  // An unknown reading gets its own entry rather than masquerading as "Off".
+  // Selecting it re-reads; it is not a mode.
+  const selectorOptions =
+    reading.mode === "unknown"
+      ? [...modeOptions, { data: "unknown", label: "Unknown — can't read Gamescope" }]
+      : modeOptions;
   const managedNames = managedEntries.map(([, info]) => info.name).join(", ");
   const modeDescription =
-    filterMode === "system"
-      ? runningApp
-        ? `Filtering the whole screen right now, including ${runningApp.name}.`
-        : "Filtering the whole screen right now, including the Steam UI."
-      : filterMode === "app"
-        ? runningWrapper !== null && runningApp
-          ? `Saved in ${runningApp.name}'s launch options — it applies the next time that game starts, not to the copy already running.`
-          : `Saved for ${managedNames}. Applies the next time each game starts.`
-        : runningApp
-          ? `No filter. Active app saves it for ${runningApp.name}'s next launch; System-wide filters everything now.`
-          : "No filter. Start a game to use Active app, or use System-wide for the whole screen.";
+    reading.mode === "unknown"
+      ? `${reading.why} Changes that would add a filter are refused; Off still clears everything.`
+      : reading.mode === "system"
+        ? runningApp
+          ? `Filtering the whole screen right now, including ${runningApp.name}.`
+          : "Filtering the whole screen right now, including the Steam UI."
+        : reading.mode === "app"
+          ? runningWrapper.state === "read" && runningApp
+            ? `Saved in ${runningApp.name}'s launch options — it applies the next time that game starts, not to the copy already running.`
+            : `Saved for ${managedNames}. Applies the next time each game starts.`
+          : runningApp
+            ? `No filter. Active app saves it for ${runningApp.name}'s next launch; System-wide filters everything now.`
+            : "No filter. Start a game to use Active app, or use System-wide for the whole screen.";
   const showHeavyDownload = currentPreset?.heavy && !status.heavy_installed;
 
   return (
@@ -679,19 +698,22 @@ function Content() {
         )}
         <DropdownItem
           label="Filter mode"
-          description={
-            modeReadable
-              ? modeDescription
-              : "Couldn't read Gamescope's current filter state; changes are disabled."
-          }
-          rgOptions={modeOptions}
+          description={modeDescription}
+          rgOptions={selectorOptions}
           selectedOption={
-            modeOptions.find((o) => o.data === filterMode) ?? modeOptions[0]
+            selectorOptions.find((o) => o.data === filterMode) ??
+            selectorOptions[0]
           }
-          disabled={busy || !status.reshade_supported || !modeReadable}
-          onChange={(opt: { data: string }) =>
-            handleModeChange(opt.data as FilterMode)
-          }
+          disabled={busy || !status.reshade_supported}
+          onChange={(opt: { data: string }) => {
+            // "unknown" is a reading, not a mode: selecting it re-reads the
+            // state instead of pretending to change it.
+            if (opt.data === "unknown") {
+              void refresh();
+              return;
+            }
+            handleModeChange(opt.data as FilterMode);
+          }}
         />
         <DropdownItem
           label="Preset"

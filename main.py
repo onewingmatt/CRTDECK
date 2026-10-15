@@ -357,9 +357,10 @@ class Plugin:
         return None
 
     def _resolve_relpath(self, preset: dict, cfg: dict) -> str:
-        if preset["heavy"]:
+        """The one rule for where a preset's shader file lives."""
+        if preset.get("heavy"):
             return cfg.get("heavy_relpath", "")
-        return preset["file"]
+        return preset.get("relpath") or preset.get("file") or ""
 
     # ------------------------------------------------------------------ setup
     async def install_shaders(self) -> bool:
@@ -712,7 +713,7 @@ class Plugin:
             return False
         refreshed = 0
         for cp in cfg.get("community_presets", []):
-            relpath = cp.get("relpath") or cp.get("file")
+            relpath = self._resolve_relpath(cp, cfg)
             if not relpath:
                 continue
             path = os.path.join(self._shader_base, relpath)
@@ -904,6 +905,10 @@ class Plugin:
             "displays": self._display_list(),
             "shaders_installed": shaders_installed,
             "heavy_installed": bool(cfg.get("heavy_relpath")),
+            # The live effect path itself, not just whether it is on: the panel
+            # derives the filter mode from this, and `null` (unreadable) is a
+            # different answer from "" (nothing applied).
+            "live_effect": live_effect,
             "global_enabled": (None if live_effect is None else bool(live_effect)),
             "preset_id": cfg.get("preset_id", "aperture-grille"),
             "params": cfg.get("params", {}),

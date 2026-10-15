@@ -30,6 +30,9 @@ python3 -m py_compile main.py deckycrt_probe.py && echo "   main.py + deckycrt_p
 echo "== launch-option unit tests =="
 node scripts/test-launch-options.ts
 
+echo "== filter-mode unit tests =="
+node scripts/test-mode.ts
+
 echo "== backend harness (stubbed decky, throwaway home) =="
 python3 scripts/test-backend.py | sed 's/^/   /'
 
@@ -43,7 +46,7 @@ FIRST=$(sha256sum dist/index.js | cut -d' ' -f1)
 echo "   dist/index.js $FIRST"
 
 echo "== bundle contents =="
-for sym in toastError sliderValue paramIsUsable installWrapper removeWrapper foreign-gamescope RegisterForAppDetails check_wrapper_crashes wrapped_running_apps 0.4.3-failclosed; do
+for sym in toastError sliderValue paramIsUsable installWrapper removeWrapper foreign-gamescope RegisterForAppDetails check_wrapper_crashes wrapped_running_apps planModeChange readMode gatherModeFacts 0.4.4-mode; do
   grep -q "$sym" dist/index.js || { echo "   MISSING $sym in bundle" >&2; exit 1; }
   echo "   $sym present"
 done

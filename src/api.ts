@@ -38,6 +38,12 @@ export interface StatusInfo {
   displays: string[];
   shaders_installed: boolean;
   heavy_installed: boolean;
+  /**
+   * The shader path Gamescope is filtering with right now: "" when nothing is
+   * applied, null when the property could not be read. The panel derives the
+   * filter mode from this, so the two must not be collapsed.
+   */
+  live_effect: string | null;
   /** null means the Gamescope property could not be read; never guess Off. */
   global_enabled: boolean | null;
   preset_id: string;

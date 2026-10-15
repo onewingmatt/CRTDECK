@@ -9,4 +9,4 @@
  *
  * Bump it whenever a change needs to be confirmed on the device.
  */
-export const PLUGIN_BUILD = "0.4.3-failclosed";
+export const PLUGIN_BUILD = "0.4.4-mode";

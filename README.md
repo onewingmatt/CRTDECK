@@ -38,6 +38,10 @@ derived from live state rather than from a separate flag:
 - **System-wide** applies the filter to the entire Gamescope session, including
   Steam. That necessarily includes whatever game is in the foreground; that is
   the point of the mode, not evidence that active-app mode worked.
+- **Unknown** is not a mode but a reading: when Gamescope's live state (or the
+  running game's launch options) could not be read, the selector says so
+  instead of showing "Off". Changes that would add a filter are refused, and
+  Off still works as the way out.
 
 The two mechanisms must not stack, so switching between them clears the other
 first and refuses the switch if the clear cannot be verified.
@@ -121,12 +125,14 @@ Static checks (no device needed):
 
 That runs the Python syntax check, the launch-option unit tests
 (`scripts/test-launch-options.ts`, plain `node` — the types are stripped by the
-runtime), the backend harness (`scripts/test-backend.py`, which drives the real
-`main.py` against a stubbed `decky` module and a throwaway home, including the
-slider contract over the whole preset list), `tsc --noEmit` (a real gate — it
-must be silent), the frontend build, a check that the freshly built bundle
-contains the code just written, and a rebuild to confirm the bundle is
-byte-reproducible.
+runtime), the filter-mode unit tests (`scripts/test-mode.ts`, which drives the
+reading and the refusal rule in `src/mode.ts` with no renderer, no Steam and no
+Gamescope), the backend harness (`scripts/test-backend.py`, which drives the
+real `main.py` against a stubbed `decky` module, a scripted probe adapter and a
+throwaway home, including the slider contract over the whole preset list),
+`tsc --noEmit` (a real gate — it must be silent), the frontend build, a check
+that the freshly built bundle contains the code just written, and a rebuild to
+confirm the bundle is byte-reproducible.
 
 The parts that cannot be checked off-device, and how to do them on the BC-250:
 
