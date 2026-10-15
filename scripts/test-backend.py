@@ -108,7 +108,6 @@ def main():
             self.cores = mod.Ok([])
             self.cmdlines = {}
             self.reshade = mod.Ok(True)
-            self.xprop_present = True
             self.core_since = None
 
         # -- the probe interface main.py depends on
@@ -143,8 +142,14 @@ def main():
         def reshade_supported(self):
             return self.reshade
 
-        def xprop_installed(self):
-            return self.xprop_present
+        def gamescope_version(self):
+            return mod.Ok("gamescope version 3.16.31-ogc2+ (test)")
+
+        def effect_access(self):
+            return "x11"
+
+        def crash_guard_available(self):
+            return True
 
     probe = FakeProbe()
     plugin = mod.Plugin(probe=probe)
@@ -309,7 +314,6 @@ def main():
 
     print("backend: global-effect transitions")
     probe.writes.clear()
-    probe.xprop_present = True
     probe.displays_result = mod.Ok([":0"])
     probe.effect = mod.Ok("")
     probe.effect_stale = 1
@@ -376,42 +380,142 @@ def main():
               keys, ["<none>"])
 
     print("backend: the production probe adapter")
-    # The adapter's own failure handling, driven through its internal `run`
-    # and `which` rather than by assigning module globals.
+    # The adapter's own failure handling, driven through its internal `run`,
+    # `which` and `x11` rather than by assigning module globals. X is stubbed
+    # as unavailable here so these cases never touch a live X server.
     always_which = lambda name: "/usr/bin/" + name
     no_which = lambda name: None
+    no_x11 = types.SimpleNamespace(available=lambda: False)
 
     def timed_out_run(*args, **kwargs):
         raise subprocess.TimeoutExpired(args[0], 10)
 
     check("a missing coredumpctl is an answer, not unknown",
-          SystemProbe(run=timed_out_run, which=no_which).core_dumps("3 days ago"),
-          mod.Ok([]))
+          SystemProbe(run=timed_out_run, which=no_which, x11=no_x11)
+          .core_dumps("3 days ago"), mod.Ok([]))
     check("a timed-out ps is Unknown, not an empty list",
-          isinstance(SystemProbe(run=timed_out_run, which=always_which)
+          isinstance(SystemProbe(run=timed_out_run, which=always_which, x11=no_x11)
                      .running_wrapped_apps(), mod.Unknown), True)
     check("a failed coredumpctl list is Unknown",
           isinstance(SystemProbe(
               run=lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "denied"),
-              which=always_which).core_dumps("3 days ago"), mod.Unknown), True)
+              which=always_which, x11=no_x11).core_dumps("3 days ago"), mod.Unknown), True)
     check("gamescope with no reshade support is a real answer",
           SystemProbe(
               run=lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "usage: gamescope", ""),
-              which=always_which).reshade_supported(), mod.Ok(False))
+              which=always_which, x11=no_x11).reshade_supported(), mod.Ok(False))
     check("a missing gamescope binary is a real answer",
-          SystemProbe(run=timed_out_run, which=no_which).reshade_supported(),
-          mod.Ok(False))
+          SystemProbe(run=timed_out_run, which=no_which, x11=no_x11)
+          .reshade_supported(), mod.Ok(False))
     check("a gamescope --help that cannot run is Unknown",
-          isinstance(SystemProbe(run=timed_out_run, which=always_which)
+          isinstance(SystemProbe(run=timed_out_run, which=always_which, x11=no_x11)
                      .reshade_supported(), mod.Unknown), True)
     check("a ps listing is parsed into app ids",
           SystemProbe(
               run=lambda *a, **k: subprocess.CompletedProcess(a[0], 0, wrapped_cmd + "\n", ""),
-              which=always_which).running_wrapped_apps(), mod.Ok([1337520]))
+              which=always_which, x11=no_x11).running_wrapped_apps(), mod.Ok([1337520]))
+    check("the gamescope build string is reported",
+          SystemProbe(run=lambda *a, **k: subprocess.CompletedProcess(
+              a[0], 0, "gamescope version 3.16.31-ogc2+ (gcc 16.2.1)\n", ""),
+              which=always_which, x11=no_x11).gamescope_version(),
+          mod.Ok("gamescope version 3.16.31-ogc2+ (gcc 16.2.1)"))
     check("the plugin's default probe is the production adapter",
           isinstance(mod.Plugin().probe, SystemProbe), True)
     check("running-wrapper probe returns a list",
           isinstance(run(mod.Plugin().wrapped_running_apps()).get("app_ids"), list), True)
+
+    print("backend: reaching the effect property without xprop")
+    # The plugin must not need a binary the host may not install, so it talks to
+    # X itself; xprop is only the fallback for a host whose libX11 will not load.
+
+    class ScriptedX11:
+        """The in-process X adapter, scripted: what the probe is told to
+        believe about availability, presence and reads."""
+
+        def __init__(self, available=True, present=(":0",), value=""):
+            self._available = available
+            self._present = set(present)
+            self._value = value
+            self.writes = []
+
+        def available(self):
+            return self._available
+
+        def property_present(self, display):
+            return (display in self._present) if self._available else None
+
+        def read_effect(self, display):
+            return self._value
+
+        def write_effect(self, display, value):
+            self.writes.append((display, value))
+            self._value = value
+            return True
+
+        @staticmethod
+        def describe(display=None):
+            return "scripted"
+
+    # Two X servers on the machine, only one of them Gamescope's: the probe
+    # must return just that one, whatever the host it runs on happens to have.
+    x11 = ScriptedX11(value="deckycrt/crt.fx")
+    probe_x11 = SystemProbe(which=no_which, x11=x11, sockets=[":0", ":1"])
+    check("with libX11 the mechanism is in-process X",
+          probe_x11.effect_access(), "x11")
+    check("the property is read in-process",
+          probe_x11.read_effect(":0"), mod.Ok("deckycrt/crt.fx"))
+    check("the property is written in-process",
+          (probe_x11.write_effect(":0", "other.fx"), x11.writes),
+          (mod.Ok(None), [(":0", "other.fx")]))
+    check("only the display carrying the property is discovered",
+          probe_x11.displays(), mod.Ok([":0"]))
+    check("a machine with no X sockets is Unknown, not an empty list",
+          isinstance(SystemProbe(which=no_which, x11=x11, sockets=[]).displays(),
+                     mod.Unknown), True)
+
+    xprop_run = lambda *a, **k: subprocess.CompletedProcess(
+        a[0], 0, 'GAMESCOPE_RESHADE_EFFECT(STRING) = "deckycrt/x.fx"', "")
+    probe_xprop = SystemProbe(run=xprop_run, which=always_which, x11=no_x11)
+    check("without libX11 it falls back to the xprop binary",
+          probe_xprop.effect_access(), "xprop")
+    check("the fallback still reads the property",
+          probe_xprop.read_effect(":0"), mod.Ok("deckycrt/x.fx"))
+
+    def missing_binary_run(*args, **kwargs):
+        raise FileNotFoundError("xprop")
+
+    probe_none = SystemProbe(run=missing_binary_run, which=no_which, x11=no_x11)
+    check("with neither, the plugin says so instead of pretending",
+          probe_none.effect_access(), "none")
+    check("with neither, a read is Unknown not empty",
+          isinstance(probe_none.read_effect(":0"), mod.Unknown), True)
+
+    print("backend: the in-process X module itself")
+    # Only the no-server paths are hermetic; the live ones are checked on the
+    # device by scripts/test-x11-live.py and by the panel test.
+    x11mod = sys.modules.get("deckycrt_x11")
+    check("the X module is shipped and loadable", x11mod is not None, True)
+    if x11mod is not None:
+        check("libX11 is loadable on this machine", x11mod.available(), True)
+        check("a display that does not exist reads as unknown",
+              x11mod.read_effect(":12345"), None)
+        check("a display that does not exist cannot be written",
+              x11mod.write_effect(":12345", "x"), False)
+        check("a display that does not exist is not a Gamescope display",
+              x11mod.property_present(":12345"), None)
+
+    print("backend: diagnostics for a setup nobody has tested")
+    diag = run(plugin.get_diagnostics())
+    labels = {r["label"]: r["value"] for r in diag["rows"]}
+    check("diagnostics return ok", diag["ok"], True)
+    for needed in ("plugin_version", "effect_access", "libx11", "xprop_binary",
+                   "displays", "live_effect", "shader_dir_user",
+                   "coredumpctl", "ps", "gamescope_version", "session_type"):
+        check(f"diagnostics report {needed}", needed in labels, True)
+    check("diagnostics name the mechanism in use",
+          labels["effect_access"], "x11")
+    check("diagnostics name the shader dir gamescope searches",
+          labels["shader_dir_user"].endswith("gamescope/reshade/Shaders"), True)
 
     print("backend: config file on disk")
     cfg_path = os.path.join(home, ".config", "deckycrt", "config.json")

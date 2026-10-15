@@ -25,7 +25,7 @@ else
 fi
 
 echo "== python syntax =="
-python3 -m py_compile main.py deckycrt_probe.py && echo "   main.py + deckycrt_probe.py OK"
+python3 -m py_compile main.py deckycrt_probe.py deckycrt_x11.py && echo "   main.py + deckycrt_probe.py + deckycrt_x11.py OK"
 
 echo "== launch-option unit tests =="
 node scripts/test-launch-options.ts
@@ -46,7 +46,7 @@ FIRST=$(sha256sum dist/index.js | cut -d' ' -f1)
 echo "   dist/index.js $FIRST"
 
 echo "== bundle contents =="
-for sym in toastError sliderValue paramIsUsable installWrapper removeWrapper foreign-gamescope RegisterForAppDetails check_wrapper_crashes wrapped_running_apps planModeChange readMode gatherModeFacts 0.4.4-mode; do
+for sym in toastError sliderValue paramIsUsable installWrapper removeWrapper foreign-gamescope RegisterForAppDetails check_wrapper_crashes wrapped_running_apps planModeChange readMode gatherModeFacts getDiagnostics handleDiagnostics 0.4.5-portable; do
   grep -q "$sym" dist/index.js || { echo "   MISSING $sym in bundle" >&2; exit 1; }
   echo "   $sym present"
 done

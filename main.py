@@ -42,6 +42,11 @@ from deckycrt_probe import (  # noqa: E402 - must follow the sys.path fix
     wrapper_appid_from_cmdline,
 )
 
+try:  # noqa: E402 - same sys.path rule as the probe
+    import deckycrt_x11
+except ImportError:  # pragma: no cover - only if the module was not shipped
+    deckycrt_x11 = None
+
 PLUGIN_SLUG = "deckycrt"
 CONFIG_PATH_REL = os.path.join(".config", PLUGIN_SLUG, "config.json")
 # Gamescope resolves `--reshade-effect <path>` under these two dirs;
@@ -901,7 +906,9 @@ class Plugin:
             n.endswith(".fx") for n in os.listdir(light_dir))
         return {
             "reshade_supported": self._gamescope_reshade_supported(),
-            "xprop_available": self._xprop_available(),
+            "effect_reachable": self._effect_reachable(),
+            "effect_access": self.probe.effect_access(),
+            "crash_guard_available": self.probe.crash_guard_available(),
             "displays": self._display_list(),
             "shaders_installed": shaders_installed,
             "heavy_installed": bool(cfg.get("heavy_relpath")),
@@ -981,9 +988,12 @@ class Plugin:
         relpath = self._resolve_relpath(preset, cfg) if preset else ""
         if enabled and not relpath:
             return {"ok": False, "detail": "No shader installed for this preset."}
-        if not self.probe.xprop_installed():
+        access = self.probe.effect_access()
+        if access == "none":
             return {"ok": False,
-                    "detail": "xprop is not installed; global mode unavailable."}
+                    "detail": ("Nothing on this system can set Gamescope's "
+                               "effect property: no usable X client and no "
+                               "xprop binary.")}
         displays = self._display_list()
         if not displays:
             return {"ok": False,
@@ -1033,9 +1043,71 @@ class Plugin:
     async def set_global_enabled(self, enabled: bool) -> dict:
         return await self._set_global_enabled_impl(enabled)
 
-    def _xprop_available(self) -> bool:
-        return (self.probe.xprop_installed()
+    def _effect_reachable(self) -> bool:
+        """Whether global mode can be reached at all: some mechanism to set the
+        property, and a display to set it on."""
+        return (self.probe.effect_access() != "none"
                 and bool(self._display_list()))
+
+    async def get_diagnostics(self) -> dict:
+        """What this plugin can see about the system it is running on.
+
+        Every capability the plugin depends on, answered by the machine itself,
+        plus which mechanism is actually in use where it has a choice. This is
+        the portability instrument: on a setup nobody has tested, it is one
+        paste instead of a conversation, and it names the missing piece rather
+        than leaving a mode that silently does nothing.
+        """
+        def which(name):
+            return shutil.which(name) or ""
+
+        light = os.path.join(self._shader_base, LIGHT_SUBDIR)
+        try:
+            installed = len([n for n in os.listdir(light) if n.endswith(".fx")])
+        except OSError:
+            installed = 0
+        displays = self._display_list()
+        live = (self.probe.read_effect(displays[0]) if displays
+                else Unknown("no display"))
+        version = self.probe.gamescope_version()
+        x11_line = "module not shipped"
+        if deckycrt_x11:
+            x11_line = (deckycrt_x11.describe(displays[0]) if displays
+                        else deckycrt_x11.describe())
+
+        rows = [
+            ("plugin_version", self._plugin_version()),
+            ("decky_user_home", self._home),
+            ("plugin_dir", self._plugin_dir),
+            ("config_path", self._config_path),
+            ("config_exists", os.path.isfile(self._config_path)),
+            ("gamescope_binary", which("gamescope")),
+            ("gamescope_version", version.value if isinstance(version, Ok) else f"unknown ({version.reason})"),
+            ("reshade_supported", self._gamescope_reshade_supported()),
+            ("effect_access", self.probe.effect_access()),
+            ("libx11", "present" if deckycrt_x11 and deckycrt_x11.available() else "not loadable"),
+            ("libx11_display", x11_line),
+            ("xprop_binary", which("xprop") or "(not installed)"),
+            ("displays", ", ".join(displays) or "(none found)"),
+            ("live_effect", live.value if isinstance(live, Ok) else "unreadable"),
+            ("shader_dir_user", self._shader_base),
+            ("shader_dir_system", "/usr/share/gamescope/reshade/Shaders"),
+            ("light_shaders_installed", installed),
+            ("coredumpctl", which("coredumpctl") or "(not installed: crash guard disabled)"),
+            ("ps", which("ps") or "(not installed: probe disabled)"),
+            ("xdg_data_home", os.environ.get("XDG_DATA_HOME", "(unset)")),
+            ("session_type", os.environ.get("XDG_SESSION_TYPE", "(unset)")),
+        ]
+        return {"ok": True,
+                "rows": [{"label": k, "value": str(v)} for k, v in rows]}
+
+    def _plugin_version(self) -> str:
+        try:
+            with open(os.path.join(self._plugin_dir, "package.json"),
+                      encoding="utf-8") as f:
+                return str(json.load(f).get("version", "unknown"))
+        except (OSError, ValueError):
+            return "unknown"
 
     # ------------------------------------------------------------------ apply
     async def set_preset(self, preset_id: str) -> dict:

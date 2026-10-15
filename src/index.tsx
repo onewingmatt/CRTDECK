@@ -17,6 +17,7 @@ import {
   clearManagedApps,
   downloadHeavy,
   downloadPack,
+  getDiagnostics,
   getStatus,
   installShaders,
   note,
@@ -100,6 +101,9 @@ function Content() {
   >({ state: "no-game" });
   const [busy, setBusy] = useState(false);
   const [recoveryRan, setRecoveryRan] = useState(false);
+  const [diagRows, setDiagRows] = useState<
+    Array<{ label: string; value: string }> | null
+  >(null);
   const debounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   const refresh = async (): Promise<StatusInfo | null> => {
@@ -566,6 +570,33 @@ function Content() {
     }
   };
 
+  /**
+   * The portability instrument: what this plugin can see on this machine.
+   *
+   * A user on a setup nobody has tested can paste this instead of describing
+   * it. Every capability the plugin depends on is in the block, so a missing
+   * one names itself.
+   */
+  const handleDiagnostics = async () => {
+    try {
+      const res = await getDiagnostics();
+      const rows = res?.rows ?? [];
+      setDiagRows(rows);
+      const text = `DeckyCRT diagnostics\n${rows
+        .map((r) => `${r.label}: ${r.value}`)
+        .join("\n")}`;
+      try {
+        await navigator.clipboard?.writeText(text);
+        toast("Diagnostics copied — paste them where you're reporting.");
+      } catch (e) {
+        diag(`clipboard unavailable: ${String(e)}`);
+        toast("Diagnostics are shown below — screenshot them.");
+      }
+    } catch (e) {
+      toastError("Diagnostics", e);
+    }
+  };
+
   // ----------------------------------------------------------------- effects
 
   useEffect(() => {
@@ -838,6 +869,47 @@ function Content() {
             </ButtonItem>
           </div>
         ))}
+      </PanelSection>
+
+      <PanelSection title="This setup">
+        {!status.crash_guard_available && (
+          <PanelSectionRow>
+            <div style={{ fontSize: "0.8em", opacity: 0.75 }}>
+              Crash guard unavailable: coredumpctl is not installed, so a game
+              left unlaunchable by a Gamescope crash cannot be found
+              automatically here. Everything else works.
+            </div>
+          </PanelSectionRow>
+        )}
+        <PanelSectionRow>
+          <div style={{ fontSize: "0.8em", opacity: 0.7 }}>
+            What DeckyCRT can detect on this device
+            {status.effect_access === "xprop"
+              ? " (reaching Gamescope through the xprop fallback)"
+              : status.effect_access === "none"
+                ? " (nothing here can reach Gamescope's effect property)"
+                : ""}
+            . If something doesn't work, send this block.
+          </div>
+        </PanelSectionRow>
+        <ButtonItem layout="below" disabled={busy} onClick={handleDiagnostics}>
+          {diagRows ? "Copy diagnostics again" : "Show and copy diagnostics"}
+        </ButtonItem>
+        {diagRows && (
+          <PanelSectionRow>
+            <div
+              style={{
+                fontFamily: "monospace",
+                fontSize: "0.72em",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+                opacity: 0.9,
+              }}
+            >
+              {diagRows.map((r) => `${r.label}: ${r.value}`).join("\n")}
+            </div>
+          </PanelSectionRow>
+        )}
       </PanelSection>
     </>
   );

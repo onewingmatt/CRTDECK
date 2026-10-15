@@ -34,7 +34,21 @@ export interface ManagedApp {
 
 export interface StatusInfo {
   reshade_supported: boolean;
-  xprop_available: boolean;
+  /** Whether global mode can be reached at all on this system. */
+  effect_reachable: boolean;
+  /**
+   * How the plugin reaches Gamescope's effect property: in-process X ("x11"),
+   * the xprop binary ("xprop"), or not at all ("none"). Reported because
+   * "global mode unavailable" is otherwise indistinguishable from "this distro
+   * does not ship the utility we assumed".
+   */
+  effect_access: "x11" | "xprop" | "none";
+  /**
+   * Whether the crash guard can run: it needs coredumpctl, and without it a
+   * game left unlaunchable by a Gamescope crash cannot be found. False here
+   * means the feature is absent, not that it found nothing.
+   */
+  crash_guard_available: boolean;
   displays: string[];
   shaders_installed: boolean;
   heavy_installed: boolean;
@@ -134,3 +148,15 @@ export const setManagedApp = callable<
 
 export const clearManagedApps =
   callable<[], ActionResult>("clear_managed_apps");
+
+/**
+ * Everything the plugin can detect about the machine it is running on: each
+ * capability it depends on, and which mechanism is in use where it has a
+ * choice. This is the plugin's portability instrument — on a setup nobody has
+ * tested, it is one paste instead of a conversation, and it names the missing
+ * piece rather than leaving a mode that silently does nothing.
+ */
+export const getDiagnostics = callable<
+  [],
+  { ok: boolean; rows: Array<{ label: string; value: string }> }
+>("get_diagnostics");

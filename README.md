@@ -75,17 +75,45 @@ on the BC-250, so no FPS or resource-cost guarantee is implied.
   (RSRetroArch and CRT-Guest). They are experimental and may not compile on
   every Gamescope build.
 
+## Supported setups
+
+The plugin needs a **Gamescope session with ReShade support**, and nothing else
+from the host:
+
+- **Gamescope with `--reshade-effect`.** Check it with
+  `gamescope --help | grep -i reshade`; the panel reports what it finds. This
+  landed upstream in September 2023 and shipped in **SteamOS 3.5+**, so a Steam
+  Deck qualifies, as does Bazzite's deck image and any distro whose Gamescope
+  includes it. Older or stripped builds cannot do per-game or system-wide mode —
+  vkBasalt (`ENABLE_VKBASALT=1`, Vulkan games only) is the fallback there.
+- **A Game Mode session for System-wide mode**, because that is what Gamescope
+  is filtering. In desktop mode the per-game wrapper still works; it runs its own
+  nested Gamescope.
+- **Steam's launch-option APIs for Active app mode.** The panel says so when a
+  Steam build does not expose them.
+- **Shaders in `~/.local/share/gamescope/reshade/Shaders/deckycrt/`**, which is
+  one of the two directories Gamescope documents in its own `--help`;
+  config in `~/.config/deckycrt/config.json`. Nothing touches the read-only
+  system image.
+
+The plugin reaches Gamescope's effect property **in-process through libX11**, so
+it does not need `xprop` installed. `xprop` is used only as a fallback where
+libX11 cannot be loaded, and `coredumpctl` is optional: without it the crash
+guard cannot run, and the panel says exactly that rather than appearing to work.
+
+### If it doesn't work on your device
+
+Open the panel and press **"Show and copy diagnostics"** under *This setup*.
+That block is every capability the plugin depends on, answered by the machine
+itself: the Gamescope build string, whether ReShade support was detected, which
+mechanism reaches the effect property, which displays carry it, the live effect
+value, the shader directories, and which helper binaries are present. One paste
+is enough to identify what is missing on a setup nobody has tested yet.
+
 ## Requirements / notes
 
-- Your Gamescope build must include ReShade support
-  (`gamescope --help | grep -i reshade`). The panel shows the detected
-  status. If it's missing, per-game/global modes can't work — vkBasalt
-  (`ENABLE_VKBASALT=1`, Vulkan games only) is the fallback path.
-- System-wide mode needs `xprop` and a reachable Gamescope display. Active-app
-  mode depends on Steam exposing foreground-app and launch-option APIs.
-- Shaders live in `~/.local/share/gamescope/reshade/Shaders/deckycrt/`;
-  config in `~/.config/deckycrt/config.json`. Nothing touches the
-  read-only system image.
+- System-wide mode needs a reachable Gamescope display. Active-app mode depends
+  on Steam exposing foreground-app and launch-option APIs.
 - Heavy CRT-Royale is fetched from the
   [vkBasalt-compat fork](https://github.com/andersstorhaug/crt-royale-reshade/tree/vkbasalt)
   of crt-royale-reshade at your request (large download, may be fragile
@@ -100,14 +128,14 @@ pnpm install   # pnpm v9 required
 pnpm run build # produces dist/index.js
 ```
 
-Then zip `plugin.json`, `package.json`, `main.py`, `deckycrt_probe.py`, `dist/`,
-`shaders/`, `community/`, `README.md` and `LICENSE` and install the zip via
-Decky's Developer menu.
+Then zip `plugin.json`, `package.json`, `main.py`, `deckycrt_probe.py`,
+`deckycrt_x11.py`, `dist/`, `shaders/`, `community/`, `README.md` and `LICENSE`
+and install the zip via Decky's Developer menu.
 
-`deckycrt_probe.py` sits beside `main.py` and must ship with it: it is the only
-place that asks the system a question (processes, core dumps, Gamescope's
-property), and `main.py` imports it by path. A zip without it loads no backend
-at all.
+`deckycrt_probe.py` and `deckycrt_x11.py` sit beside `main.py` and must ship with
+it. The probe is the only place that asks the system a question (processes, core
+dumps, Gamescope's property); the X module is the only place that talks to X.
+`main.py` imports both by path, so a zip without them loads no backend at all.
 
 `community/ReShade.fxh` is vendored into every pack's `Shaders/` directory on
 install. Gamescope ships no ReShade headers and every community shader opens

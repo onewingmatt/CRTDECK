@@ -7,12 +7,13 @@ dump list as an empty list when coredumpctl failed made a scan that never
 happened look exactly like "no crashes", on the one path that decides whether
 a game can still launch.
 
-`SystemProbe` is the production adapter: subprocess, xprop, and the runuser
-rule for reaching the session's X server from a root-owned loader. Tests pass
-a scripted adapter with the same method names, so the policy that sits above
-this line is exercised through one interface instead of by assigning private
-members. `SystemProbe` takes its `run` and `which` as arguments for the same
-reason: its own failure handling is testable without swapping globals.
+`SystemProbe` is the production adapter: subprocess, and X via `deckycrt_x11`
+(in-process, no binary required) with the `xprop` binary kept as a fallback for
+hosts where libX11 is not loadable. Tests pass a scripted adapter with the same
+method names, so the policy that sits above this line is exercised through one
+interface instead of by assigning private members. `SystemProbe` takes its
+`run`, `which` and `x11` as arguments for the same reason: its own failure
+handling is testable without swapping globals.
 """
 
 import os
@@ -22,6 +23,11 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Union
+
+try:
+    import deckycrt_x11
+except ImportError:  # pragma: no cover - only if the module was not shipped
+    deckycrt_x11 = None
 
 # One timeout policy for every question this plugin asks a process. These were
 # five separate literals scattered across the callers before.
@@ -91,9 +97,27 @@ def parse_effect_property(output: str) -> tuple[bool, str]:
 class SystemProbe:
     """The production adapter. Every method answers or reports Unknown."""
 
-    def __init__(self, run=None, which=None):
+    def __init__(self, run=None, which=None, x11=None, sockets=None):
         self._run = run or subprocess.run
         self._which = which or shutil.which
+        self._x11 = x11 if x11 is not None else deckycrt_x11
+        # The X socket directory is a fact about the machine, so it is an
+        # argument too: tests pin it instead of inheriting whatever the host
+        # happens to have running.
+        self._sockets = list(sockets) if sockets is not None else None
+
+    def _x_sockets(self) -> Result:
+        """The display names of the X servers this machine is running."""
+        if self._sockets is not None:
+            return Ok(list(self._sockets))
+        sockets = []
+        try:
+            for name in os.listdir("/tmp/.X11-unix"):
+                if name.startswith("X") and name[1:].isdigit():
+                    sockets.append(":" + name[1:])
+        except OSError as e:
+            return Unknown(f"cannot list X sockets: {e}")
+        return Ok(sockets)
 
     # -- processes
 
@@ -181,35 +205,100 @@ class SystemProbe:
     def xprop_installed(self) -> bool:
         return self._which("xprop") is not None
 
+    def crash_guard_available(self) -> bool:
+        """Whether the crash guard can run at all.
+
+        It needs coredumpctl. When that is missing, `core_dumps()` correctly
+        answers "nothing to read" — which is why the absence has to be reported
+        separately, or the feature looks present and simply never fires.
+        """
+        return self._which("coredumpctl") is not None
+
+    def gamescope_version(self) -> Result:
+        """The gamescope build string.
+
+        Portability reports need it: ReShade support and its behaviour differ
+        between builds, and "it doesn't work" is unanswerable without knowing
+        which compositor is running.
+        """
+        gs = self._which("gamescope")
+        if not gs:
+            return Unknown("gamescope is not installed")
+        try:
+            p = self._run([gs, "--version"], capture_output=True, text=True,
+                          timeout=GAMESCOPE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return Unknown(f"gamescope --version failed: {e}")
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        if not out:
+            return Unknown("gamescope --version printed nothing")
+        return Ok(out.splitlines()[0][:120])
+
     def displays(self) -> Result:
         """Displays that really carry Gamescope's reshade property.
 
-        Other Xwayland servers in the session answer xprop but have no
-        GAMESCOPE_* properties, so writing to them silently does nothing.
+        Other Xwayland servers in the same session open fine and answer
+        questions, but have no GAMESCOPE_* property, so writing to them
+        silently does nothing. Only Gamescope's own Xwayland counts.
         """
-        sockets = []
-        try:
-            for name in os.listdir("/tmp/.X11-unix"):
-                if name.startswith("X") and name[1:].isdigit():
-                    sockets.append(":" + name[1:])
-        except OSError as e:
-            return Unknown(f"cannot list X sockets: {e}")
+        listing = self._x_sockets()
+        if isinstance(listing, Unknown):
+            return listing
+        sockets = listing.value
         if not sockets:
             return Unknown("no X server socket found")
         found = []
+        unanswerable = 0
+        x11 = self._x11_backend()
         for display in sockets:
-            result = self._xprop(display, "-notype", EFFECT_PROPERTY)
-            if isinstance(result, Unknown):
-                continue
-            rc, out = result.value
-            if rc == 0 and "not found" not in out:
+            present = x11.property_present(display) if x11 is not None else None
+            if present is None:
+                # Fall back to the xprop binary for the yes/no question only.
+                result = self._xprop(display, "-notype", EFFECT_PROPERTY)
+                if isinstance(result, Unknown):
+                    unanswerable += 1
+                    continue
+                rc, out = result.value
+                present = rc == 0 and "not found" not in out
+            if present:
                 found.append(display)
-        if not found:
-            return Unknown("no display carries " + EFFECT_PROPERTY)
-        return Ok(found)
+        if found:
+            return Ok(found)
+        if unanswerable:
+            return Unknown("no display could be asked about " + EFFECT_PROPERTY)
+        return Unknown("no display carries " + EFFECT_PROPERTY)
+
+    def effect_access(self) -> str:
+        """How this plugin can reach the effect property: x11, xprop, or none.
+
+        In-process X is the mechanism; xprop is the fallback for a host whose
+        libX11 cannot be loaded. Which one is in use is a fact worth reporting,
+        because "global mode unavailable" is otherwise indistinguishable from
+        "this distro does not ship the utility we assumed".
+        """
+        if self._x11_usable():
+            return "x11"
+        if self._which("xprop"):
+            return "xprop"
+        return "none"
+
+    def _x11_backend(self):
+        """The in-process X module when it is usable, else None."""
+        x11 = self._x11
+        return x11 if (x11 and x11.available()) else None
+
+    def _x11_usable(self) -> bool:
+        return self._x11_backend() is not None
 
     def read_effect(self, display: str) -> Result:
         """The exact live effect path on one display, or Unknown."""
+        x11 = self._x11_backend()
+        if x11 is not None:
+            value = x11.read_effect(display)
+            if value is not None:
+                return Ok(value)
+            return Unknown(f"in-process X could not read {EFFECT_PROPERTY} "
+                           f"on {display}")
         result = self._xprop(display, "-notype", EFFECT_PROPERTY)
         if isinstance(result, Unknown):
             return result
@@ -225,9 +314,15 @@ class SystemProbe:
     def write_effect(self, display: str, value: str) -> Result:
         """Set the effect property to `value` and report the write itself.
 
-        The write returning 0 is not proof Gamescope took it: the caller reads
+        The write succeeding is not proof Gamescope took it: the caller reads
         back until the value is observed.
         """
+        x11 = self._x11_backend()
+        if x11 is not None:
+            if x11.write_effect(display, value):
+                return Ok(None)
+            return Unknown(f"in-process X could not set {EFFECT_PROPERTY} "
+                           f"on {display}")
         result = self._xprop(display, "-f", EFFECT_PROPERTY, "8s", "-set",
                             EFFECT_PROPERTY, value)
         if isinstance(result, Unknown):

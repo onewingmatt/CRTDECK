@@ -120,6 +120,14 @@ const wrappedRunningApps = callable("wrapped_running_apps");
  */
 const setManagedApp = callable("set_managed_app");
 const clearManagedApps = callable("clear_managed_apps");
+/**
+ * Everything the plugin can detect about the machine it is running on: each
+ * capability it depends on, and which mechanism is in use where it has a
+ * choice. This is the plugin's portability instrument — on a setup nobody has
+ * tested, it is one paste instead of a conversation, and it names the missing
+ * piece rather than leaving a mode that silently does nothing.
+ */
+const getDiagnostics = callable("get_diagnostics");
 
 /**
  * Launch-option surgery for DeckyCRT's active-app mode.
@@ -632,7 +640,7 @@ async function writeLaunchOptions(appId, value) {
  *
  * Bump it whenever a change needs to be confirmed on the device.
  */
-const PLUGIN_BUILD = "0.4.4-mode";
+const PLUGIN_BUILD = "0.4.5-portable";
 
 function toast(body) {
     toaster.toast({ title: "DeckyCRT", body });
@@ -683,6 +691,7 @@ function Content() {
     const [runningWrapper, setRunningWrapper] = SP_REACT.useState({ state: "no-game" });
     const [busy, setBusy] = SP_REACT.useState(false);
     const [recoveryRan, setRecoveryRan] = SP_REACT.useState(false);
+    const [diagRows, setDiagRows] = SP_REACT.useState(null);
     const debounceTimers = SP_REACT.useRef({});
     const refresh = async () => {
         try {
@@ -1119,6 +1128,34 @@ function Content() {
             toastError("Pack removal", e);
         }
     };
+    /**
+     * The portability instrument: what this plugin can see on this machine.
+     *
+     * A user on a setup nobody has tested can paste this instead of describing
+     * it. Every capability the plugin depends on is in the block, so a missing
+     * one names itself.
+     */
+    const handleDiagnostics = async () => {
+        try {
+            const res = await getDiagnostics();
+            const rows = res?.rows ?? [];
+            setDiagRows(rows);
+            const text = `DeckyCRT diagnostics\n${rows
+                .map((r) => `${r.label}: ${r.value}`)
+                .join("\n")}`;
+            try {
+                await navigator.clipboard?.writeText(text);
+                toast("Diagnostics copied — paste them where you're reporting.");
+            }
+            catch (e) {
+                diag(`clipboard unavailable: ${String(e)}`);
+                toast("Diagnostics are shown below — screenshot them.");
+            }
+        }
+        catch (e) {
+            toastError("Diagnostics", e);
+        }
+    };
     // ----------------------------------------------------------------- effects
     SP_REACT.useEffect(() => {
         diag(`panel build ${PLUGIN_BUILD} mounted`);
@@ -1241,7 +1278,17 @@ function Content() {
                                     ? "Working…"
                                     : pack.installed
                                         ? `Remove ${pack.name}`
-                                        : `Download ${pack.name}` })] }, pack.id)))] })] }));
+                                        : `Download ${pack.name}` })] }, pack.id)))] }), SP_JSX.jsxs(DFL.PanelSection, { title: "This setup", children: [!status.crash_guard_available && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: { fontSize: "0.8em", opacity: 0.75 }, children: "Crash guard unavailable: coredumpctl is not installed, so a game left unlaunchable by a Gamescope crash cannot be found automatically here. Everything else works." }) })), SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsxs("div", { style: { fontSize: "0.8em", opacity: 0.7 }, children: ["What DeckyCRT can detect on this device", status.effect_access === "xprop"
+                                    ? " (reaching Gamescope through the xprop fallback)"
+                                    : status.effect_access === "none"
+                                        ? " (nothing here can reach Gamescope's effect property)"
+                                        : "", ". If something doesn't work, send this block."] }) }), SP_JSX.jsx(DFL.ButtonItem, { layout: "below", disabled: busy, onClick: handleDiagnostics, children: diagRows ? "Copy diagnostics again" : "Show and copy diagnostics" }), diagRows && (SP_JSX.jsx(DFL.PanelSectionRow, { children: SP_JSX.jsx("div", { style: {
+                                fontFamily: "monospace",
+                                fontSize: "0.72em",
+                                whiteSpace: "pre-wrap",
+                                wordBreak: "break-word",
+                                opacity: 0.9,
+                            }, children: diagRows.map((r) => `${r.label}: ${r.value}`).join("\n") }) }))] })] }));
 }
 var index = definePlugin(() => {
     return {
