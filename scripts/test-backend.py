@@ -238,9 +238,17 @@ def main():
           parse("GAMESCOPE_RESHADE_EFFECT(STRING) = "), (True, ""))
     check("parses empty xprop value with quotes",
           parse('GAMESCOPE_RESHADE_EFFECT(STRING) = ""'), (True, ""))
-    check("recognizes absent X atom",
+    check("an absent atom is unreadable, never an empty read",
           parse("GAMESCOPE_RESHADE_EFFECT:  no such atom on any window."),
-          (True, ""))
+          (False, ""))
+    present = probe_mod.parse_property_present
+    check("a set-but-empty property counts as present",
+          present("GAMESCOPE_RESHADE_EFFECT = "), True)
+    check("an atom the server never heard of is not present",
+          present("GAMESCOPE_RESHADE_EFFECT:  no such atom on any window."),
+          False)
+    check("an atom known but unset is not present",
+          present("WM_HINTS:  not found."), False)
     check("unknown output containing fx fails closed",
           parse("unexpected .fx output"), (False, ""))
     check("unrelated output fails closed", parse("xprop: unable to open display"),
@@ -463,17 +471,22 @@ def main():
         """The in-process X adapter, scripted: what the probe is told to
         believe about availability, presence and reads."""
 
-        def __init__(self, available=True, present=(":0",), value=""):
+        def __init__(self, available=True, present=(":0",), value="", marker=()):
             self._available = available
             self._present = set(present)
+            self._marker = set(marker)
             self._value = value
             self.writes = []
 
         def available(self):
             return self._available
 
-        def property_present(self, display):
-            return (display in self._present) if self._available else None
+        def property_present(self, display, name=probe_mod.EFFECT_PROPERTY):
+            if not self._available:
+                return None
+            if name == probe_mod.EFFECT_PROPERTY:
+                return display in self._present
+            return display in self._marker
 
         def read_effect(self, display):
             return self._value
@@ -487,10 +500,14 @@ def main():
         def describe(display=None):
             return "scripted"
 
-    # Two X servers on the machine, only one of them Gamescope's: the probe
-    # must return just that one, whatever the host it runs on happens to have.
-    x11 = ScriptedX11(value="deckycrt/crt.fx")
-    probe_x11 = SystemProbe(which=no_which, x11=x11, sockets=[":0", ":1"])
+    # Two X servers on the machine, both carrying the effect property — the
+    # shape the device actually has (`--xwayland-count 2`). Only Gamescope's
+    # own root window carries the technique index next to it, so the probe must
+    # return that display FIRST whatever order the host happens to list its
+    # sockets in. The earlier version of this test assumed the other server had
+    # no property at all, which is the assumption the device breaks.
+    x11 = ScriptedX11(value="deckycrt/crt.fx", present=(":0", ":1"), marker=(":0",))
+    probe_x11 = SystemProbe(which=no_which, x11=x11, sockets=[":1", ":0"])
     check("with libX11 the mechanism is in-process X",
           probe_x11.effect_access(), "x11")
     check("the property is read in-process",
@@ -498,8 +515,15 @@ def main():
     check("the property is written in-process",
           (probe_x11.write_effect(":0", "other.fx"), x11.writes),
           (mod.Ok(None), [(":0", "other.fx")]))
-    check("only the display carrying the property is discovered",
-          probe_x11.displays(), mod.Ok([":0"]))
+    check("the compositor's own display outranks the socket order",
+          probe_x11.displays(), mod.Ok([":0", ":1"]))
+    check("one X server, Gamescope's: it is the only display returned",
+          SystemProbe(which=no_which, x11=ScriptedX11(value=""),
+                      sockets=[":0", ":1"]).displays(), mod.Ok([":0"]))
+    check("with no marker anywhere the socket order stands",
+          SystemProbe(which=no_which,
+                      x11=ScriptedX11(present=(":0", ":1")),
+                      sockets=[":1", ":0"]).displays(), mod.Ok([":1", ":0"]))
     check("a machine with no X sockets is Unknown, not an empty list",
           isinstance(SystemProbe(which=no_which, x11=x11, sockets=[]).displays(),
                      mod.Unknown), True)
@@ -511,6 +535,24 @@ def main():
           probe_xprop.effect_access(), "xprop")
     check("the fallback still reads the property",
           probe_xprop.read_effect(":0"), mod.Ok("deckycrt/x.fx"))
+
+    def absent_atom_run(*a, **k):
+        # xprop's real text for a name the server does not know, exit code 0.
+        return subprocess.CompletedProcess(
+            a[0], 0, "DECKYCRT_NOPE:  no such atom on any window.", "")
+
+    check("a server that never heard of the property is not a Gamescope display",
+          SystemProbe(run=absent_atom_run, which=always_which, x11=no_x11,
+                      sockets=[":0", ":1"]).displays(),
+          mod.Unknown("no display carries " + probe_mod.EFFECT_PROPERTY))
+
+    def absent_property_run(*a, **k):
+        return subprocess.CompletedProcess(a[0], 0, "WM_HINTS:  not found.", "")
+
+    check("a server that knows the atom but not the property is not one either",
+          SystemProbe(run=absent_property_run, which=always_which, x11=no_x11,
+                      sockets=[":0"]).displays(),
+          mod.Unknown("no display carries " + probe_mod.EFFECT_PROPERTY))
 
     def missing_binary_run(*args, **kwargs):
         raise FileNotFoundError("xprop")
@@ -540,7 +582,8 @@ def main():
     labels = {r["label"]: r["value"] for r in diag["rows"]}
     check("diagnostics return ok", diag["ok"], True)
     for needed in ("plugin_version", "effect_access", "libx11", "xprop_binary",
-                   "displays", "live_effect", "shader_dir_user",
+                   "displays", "effect_display", "live_effect",
+                   "shader_dir_user",
                    "coredumpctl", "ps", "gamescope_version", "session_type"):
         check(f"diagnostics report {needed}", needed in labels, True)
     check("diagnostics name the mechanism in use",

@@ -98,16 +98,16 @@ class _Connection:
             self._lib.XCloseDisplay(self.conn)
             self.conn = None
 
-    def has_property(self):
-        """Whether this root window carries the property at all.
+    def has_property(self, name=EFFECT_PROPERTY):
+        """Whether this root window carries `name` at all.
 
         Not the same as "the atom exists": every X server in a session can know
         the atom, so that says nothing about which one Gamescope is running on.
-        Only Gamescope's Xwayland has the property *set* (as an empty string at
-        startup). Returns None when the question cannot be asked.
+        Only Gamescope's own Xwayland has the property *set* (as an empty string
+        at startup). Returns None when the question cannot be asked.
         """
         lib = self._lib
-        atom = lib.XInternAtom(self.conn, EFFECT_PROPERTY.encode(), True)
+        atom = lib.XInternAtom(self.conn, name.encode(), True)
         if not atom:
             return False
         actual_type = ctypes.c_ulong(0)
@@ -201,8 +201,11 @@ def write_effect(display, value):
         conn.close()
 
 
-def property_present(display):
-    """Whether `display` is a Gamescope X server, i.e. carries the property.
+def property_present(display, name=EFFECT_PROPERTY):
+    """Whether `display` carries the property `name` on its root window.
+
+    Defaults to the effect property, but any GAMESCOPE_* name works: which
+    server is the compositor's own is decided by which properties it carries.
 
     None when the display cannot be asked, which the caller must not read as
     "no".
@@ -212,7 +215,7 @@ def property_present(display):
     except X11Unavailable:
         return None
     try:
-        return conn.has_property()
+        return conn.has_property(name)
     finally:
         conn.close()
 

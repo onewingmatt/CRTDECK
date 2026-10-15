@@ -1089,6 +1089,12 @@ class Plugin:
             ("libx11_display", x11_line),
             ("xprop_binary", which("xprop") or "(not installed)"),
             ("displays", ", ".join(displays) or "(none found)"),
+            # Which one the plugin will actually read and write. On a machine
+            # with `--xwayland-count 2` the second Xwayland carries a mirror of
+            # the effect property, and writing to that mirror is a no-op that
+            # reads back as success — so this row is the first thing to check
+            # when "system-wide does nothing".
+            ("effect_display", displays[0] if displays else "(none)"),
             ("live_effect", live.value if isinstance(live, Ok) else "unreadable"),
             ("shader_dir_user", self._shader_base),
             ("shader_dir_system", "/usr/share/gamescope/reshade/Shaders"),

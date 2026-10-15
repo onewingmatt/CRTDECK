@@ -51,6 +51,19 @@ LEAKY_ENV_VARS = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH")
 
 PS_ARGS = ["ps", "-eo", "args"]
 EFFECT_PROPERTY = "GAMESCOPE_RESHADE_EFFECT"
+# Gamescope creates the effect property on its own Xwayland next to this
+# technique index, and mirrors only a handful of the GAMESCOPE_* properties
+# (the effect among them) onto any second Xwayland it runs. Measured on the
+# BC-250 (`--xwayland-count 2`, 2026-10-15): both :0 and :1 carry
+# GAMESCOPE_RESHADE_EFFECT as an empty string, but :1 carries 9 of :0's 51
+# GAMESCOPE_* properties and neither this marker nor the index it names. So
+# "the property is present" does not identify the display the compositor
+# reads, and a single mirror can be the only display a naive scan finds.
+#
+# The effect property on a mirror is also a dead end, not a second target:
+# writing to :1 leaves :0 untouched and the compositor does not react, so a
+# write that lands there is a no-op that reads back as success.
+MARKER_PROPERTY = "GAMESCOPE_RESHADE_TECHNIQUE_IDX"
 
 
 def child_env() -> dict:
@@ -103,10 +116,30 @@ def wrapper_appid_from_cmdline(cmdline: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def parse_property_present(output: str) -> bool:
+    """Whether an xprop readback means the property is *set* on that root.
+
+    Three readbacks, all with exit code 0, measured on the box on 2026-10-15:
+
+        GAMESCOPE_RESHADE_EFFECT =                       # set, empty value
+        WM_HINTS:  not found.                            # atom known, not set
+        NO_SUCH_PROP:  no such atom on any window.       # atom unknown here
+
+    Only the first means the server knows and carries this property. The other
+    two are the same answer for our purposes: this is not the compositor's own
+    root window, so it must not be counted as one.
+    """
+    text = output.lower()
+    return "no such atom" not in text and "not found" not in text
+
+
 def parse_effect_property(output: str) -> tuple[bool, str]:
     """Parse xprop output; distinguish empty from unreadable/unparseable."""
     if "no such atom" in output.lower():
-        return True, ""
+        # The server does not know this property at all, so it cannot tell us
+        # whether an effect is live. An empty value is a *different* answer —
+        # returning one here is how "Off" gets reported while a filter is on.
+        return False, ""
     # xprop -notype emits `NAME = "/path.fx"`; typed xprop emits
     # `NAME(STRING) = "/path.fx"`. Empty values appear as `NAME = ` or
     # `NAME(STRING) = ` (sometimes with quotes).
@@ -263,12 +296,41 @@ class SystemProbe:
             return Unknown("gamescope --version printed nothing")
         return Ok(out.splitlines()[0][:120])
 
-    def displays(self) -> Result:
-        """Displays that really carry Gamescope's reshade property.
+    def _property_present(self, display: str, name: str):
+        """Whether `display` carries `name` on its root window, or None.
 
-        Other Xwayland servers in the same session open fine and answer
-        questions, but have no GAMESCOPE_* property, so writing to them
-        silently does nothing. Only Gamescope's own Xwayland counts.
+        None means the question could not be asked; the caller must not read
+        that as "no".
+        """
+        x11 = self._x11_backend()
+        if x11 is not None:
+            return x11.property_present(display, name)
+        # Fall back to the xprop binary for the yes/no question only.
+        result = self._xprop(display, "-notype", name)
+        if isinstance(result, Unknown):
+            return None
+        rc, out = result.value
+        if rc != 0:
+            return None
+        return parse_property_present(out)
+
+    @staticmethod
+    def _display_number(display: str) -> int:
+        try:
+            return int(str(display).lstrip(":").split(".")[0])
+        except ValueError:
+            return 1 << 30
+
+    def displays(self) -> Result:
+        """The displays whose effect property Gamescope actually reads.
+
+        Not simply "every display that carries the property": with
+        `--xwayland-count 2` a second Xwayland carries a mirror of it, and a
+        write to the mirror is accepted and reads back as success while the
+        compositor never sees it. The compositor's own root window carries the
+        technique index next to the effect property, so those come first and the
+        lowest display number wins — Gamescope creates the session's Xwayland
+        before any nested one it starts for a wrapped game.
         """
         listing = self._x_sockets()
         if isinstance(listing, Unknown):
@@ -278,24 +340,20 @@ class SystemProbe:
             return Unknown("no X server socket found")
         found = []
         unanswerable = 0
-        x11 = self._x11_backend()
         for display in sockets:
-            present = x11.property_present(display) if x11 is not None else None
+            present = self._property_present(display, EFFECT_PROPERTY)
             if present is None:
-                # Fall back to the xprop binary for the yes/no question only.
-                result = self._xprop(display, "-notype", EFFECT_PROPERTY)
-                if isinstance(result, Unknown):
-                    unanswerable += 1
-                    continue
-                rc, out = result.value
-                present = rc == 0 and "not found" not in out
+                unanswerable += 1
+                continue
             if present:
                 found.append(display)
-        if found:
-            return Ok(found)
-        if unanswerable:
-            return Unknown("no display could be asked about " + EFFECT_PROPERTY)
-        return Unknown("no display carries " + EFFECT_PROPERTY)
+        if not found:
+            if unanswerable:
+                return Unknown("no display could be asked about " + EFFECT_PROPERTY)
+            return Unknown("no display carries " + EFFECT_PROPERTY)
+        own = [d for d in found if self._property_present(d, MARKER_PROPERTY)]
+        own.sort(key=self._display_number)
+        return Ok(own + [d for d in found if d not in own])
 
     def effect_access(self) -> str:
         """How this plugin can reach the effect property: x11, xprop, or none.
