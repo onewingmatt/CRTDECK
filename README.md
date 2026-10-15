@@ -96,9 +96,14 @@ pnpm install   # pnpm v9 required
 pnpm run build # produces dist/index.js
 ```
 
-Then zip `plugin.json`, `package.json`, `main.py`, `dist/`, `shaders/`,
-`community/`, `README.md` and `LICENSE` and install the zip via Decky's
-Developer menu.
+Then zip `plugin.json`, `package.json`, `main.py`, `deckycrt_probe.py`, `dist/`,
+`shaders/`, `community/`, `README.md` and `LICENSE` and install the zip via
+Decky's Developer menu.
+
+`deckycrt_probe.py` sits beside `main.py` and must ship with it: it is the only
+place that asks the system a question (processes, core dumps, Gamescope's
+property), and `main.py` imports it by path. A zip without it loads no backend
+at all.
 
 `community/ReShade.fxh` is vendored into every pack's `Shaders/` directory on
 install. Gamescope ships no ReShade headers and every community shader opens

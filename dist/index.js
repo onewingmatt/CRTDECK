@@ -100,6 +100,10 @@ const note = callable("note");
 /**
  * Games whose launch died with gamescope while running under our per-game
  * wrapper. Those games cannot start until the wrapper is stripped.
+ *
+ * `ok: false` means the scan itself could not run — which is NOT the same as
+ * "no crashes", and is worth telling the user about: a game may be sitting
+ * there unlaunchable while every check reports all clear.
  */
 const checkWrapperCrashes = callable("check_wrapper_crashes");
 /**
@@ -677,8 +681,15 @@ function Content() {
             toastError("Wrapper crash check", e);
             return false;
         }
-        if (!res?.crashes?.length)
+        if (!res?.crashes?.length) {
+            // A scan that could not run is not "no crashes". Staying silent here is
+            // how a game sits unlaunchable while every check reports all clear.
+            if (res && res.ok === false) {
+                diag(`crash scan could not run: ${res.detail ?? "no detail"}`);
+                toast("Couldn't check whether a saved CRT wrapper is stopping a game from launching — see the plugin log.");
+            }
             return false;
+        }
         const rel = shaderPathFor(s);
         const cleaned = [];
         const stuck = [];

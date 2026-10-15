@@ -87,10 +87,18 @@ export const note = callable<[message: string], ActionResult>("note");
 /**
  * Games whose launch died with gamescope while running under our per-game
  * wrapper. Those games cannot start until the wrapper is stripped.
+ *
+ * `ok: false` means the scan itself could not run — which is NOT the same as
+ * "no crashes", and is worth telling the user about: a game may be sitting
+ * there unlaunchable while every check reports all clear.
  */
 export const checkWrapperCrashes = callable<
   [],
-  { ok: boolean; crashes: Array<{ app_id: number; name: string; shader: string }> }
+  {
+    ok: boolean;
+    detail?: string;
+    crashes: Array<{ app_id: number; name: string; shader: string }>;
+  }
 >("check_wrapper_crashes");
 
 /**

@@ -5,6 +5,12 @@ The panel only runs inside Steam, so the backend is exercised here the way the
 loader runs it: a stubbed `decky` module, the plugin dir on sys.path, and a
 throwaway DECKY_USER_HOME so nothing touches the real ~/.config/deckycrt.
 
+Everything that asks the system a question goes through the probe module, so
+these tests hand the plugin a scripted adapter (`FakeProbe`) instead of
+assigning private members. That is what makes the failure paths testable: a
+probe that cannot answer is now a case the plugin must handle, not a case the
+harness hides.
+
 Covers the parts the frontend depends on:
   - the managed-app registry (the only way Off / System-wide can find a wrapper
     after the game exits)
@@ -12,6 +18,10 @@ Covers the parts the frontend depends on:
     min <= default <= max and step > 0, because a SliderField with an
     out-of-range value takes the whole panel down
   - install_shaders + get_status on a clean home
+  - the fail-closed rule on every probe: an unanswerable question is reported
+    as a failure, never as an empty answer
+  - the production probe adapter's own failure handling (timeouts, nonzero
+    exits, a missing binary)
 
 Run: python3 scripts/test-backend.py
 """
@@ -21,6 +31,7 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -67,18 +78,84 @@ def load_plugin(home):
 def main():
     home = tempfile.mkdtemp(prefix="deckycrt-test-home-")
     mod = load_plugin(home)
-    plugin = mod.Plugin()
+    probe_mod = sys.modules["deckycrt_probe"]
+    SystemProbe = probe_mod.SystemProbe
+    core_row = ("Tue 2026-10-13 19:03:11 ADT 23952 1000 1000 SIGSEGV "
+                "inaccessible /usr/bin/gamescope -")
+    session_row = ("Tue 2026-10-13 18:20:00 ADT 4674 1000 1000 SIGABRT "
+                   "missing /usr/bin/gamescope -")
+    wrapped_cmd = (
+        "gamescope --reshade-effect deckycrt-community/rsretroarch/Shaders/"
+        "CRTLottes2.fx -- /usr/bin/steam-launch-wrapper -- /usr/bin/reaper "
+        "SteamLaunch AppId=1337520 -- /usr/bin/proton waitforexitandrun "
+        "/games/Risk of Rain Returns.exe")
+
+    class FakeProbe:
+        """The test adapter: scripted answers, the same methods as SystemProbe.
+
+        `effect_stale` models Gamescope's render lag: an xprop write only
+        becomes visible on the next composited frame, so a single immediate
+        readback makes a successful toggle look like a no-op and invites the
+        second press that stacks a filter.
+        """
+
+        def __init__(self):
+            self.displays_result = mod.Ok([":0"])
+            self.effect = mod.Ok("")
+            self.effect_stale = 0
+            self.writes = []
+            self.running = mod.Ok([])
+            self.cores = mod.Ok([])
+            self.cmdlines = {}
+            self.reshade = mod.Ok(True)
+            self.xprop_present = True
+            self.core_since = None
+
+        # -- the probe interface main.py depends on
+        def displays(self):
+            return self.displays_result
+
+        def read_effect(self, display):
+            if isinstance(self.effect, mod.Unknown):
+                return self.effect
+            if self.effect_stale > 0:
+                self.effect_stale -= 1
+                return mod.Ok("")
+            return self.effect
+
+        def write_effect(self, display, value):
+            self.writes.append(value)
+            self.effect = mod.Ok(value)
+            self.effect_stale = 1
+            return mod.Ok(None)
+
+        def running_wrapped_apps(self):
+            return self.running
+
+        def core_dumps(self, since):
+            self.core_since = since
+            return self.cores
+
+        def core_cmdline(self, pid):
+            return self.cmdlines.get(str(pid),
+                                     mod.Unknown(f"no record for {pid}"))
+
+        def reshade_supported(self):
+            return self.reshade
+
+        def xprop_installed(self):
+            return self.xprop_present
+
+    probe = FakeProbe()
+    plugin = mod.Plugin(probe=probe)
     run = asyncio.run
 
     print("backend: shaders + status")
-    old_displays, old_xprop = plugin._gamescope_displays, plugin._xprop
-    try:
-        plugin._gamescope_displays = lambda: [":0"]
-        plugin._xprop = lambda *args: (1, "xprop: unable to open display")
-        check("failed live read stays unknown in status",
-              run(plugin.get_status())["global_enabled"], None)
-    finally:
-        plugin._gamescope_displays, plugin._xprop = old_displays, old_xprop
+    probe.displays_result = mod.Ok([":0"])
+    probe.effect = mod.Unknown("xprop: unable to open display :0")
+    check("failed live read stays unknown in status",
+          run(plugin.get_status())["global_enabled"], None)
+    probe.effect = mod.Ok("")
     check("install_shaders succeeds", run(plugin.install_shaders()), True)
     status = run(plugin.get_status())
     check("status reports shaders installed", status["shaders_installed"], True)
@@ -116,7 +193,7 @@ def main():
           "deckycrt/aperture-grille.fx")
 
     # The registry must survive a plugin reload: it is the on-disk record.
-    reloaded = mod.Plugin()
+    reloaded = mod.Plugin(probe=probe)
     check("registry is persisted to config.json",
           run(reloaded.get_status())["managed_apps"].get(str(app_id), {}).get("name"),
           "Risk of Rain Returns")
@@ -164,131 +241,15 @@ def main():
     check("unrelated output fails closed", parse("xprop: unable to open display"),
           (False, ""))
 
-    print("backend: global-effect transitions")
-    # xprop's write only becomes visible after Gamescope's next render tick, so a
-    # single immediate readback makes a successful toggle look like a no-op and
-    # invites the second press that stacks a filter. These stubs model that lag.
-    saved = {
-        "displays": plugin._gamescope_displays,
-        "xprop": plugin._xprop,
-        "which": mod.shutil.which,
-        "sleep": mod.asyncio.sleep,
-        "preset": plugin._preset_by_id,
-        "resolve": plugin._resolve_relpath,
-    }
-    writes = []
-    live = {"value": "", "stale": 1, "readable": True}
-
-    def fake_xprop(display, *args):
-        if "-set" in args:
-            writes.append(args[-1])
-            live["value"] = args[-1]
-            live["stale"] = 1
-            return 0, ""
-        if args[-1] == "GAMESCOPE_RESHADE_EFFECT":
-            if not live["readable"]:
-                return 1, "xprop: unable to open display :0"
-            stale, live["stale"] = live["stale"], max(0, live["stale"] - 1)
-            shown = "" if stale > 0 else live["value"]
-            return 0, f'GAMESCOPE_RESHADE_EFFECT(STRING) = "{shown}"'
-        return 0, ""
-
-    async def no_wait(_seconds):
-        return None
-
-    try:
-        plugin._gamescope_displays = lambda: [":0"]
-        plugin._xprop = fake_xprop
-        plugin._preset_by_id = lambda pid, cfg: {
-            "id": pid, "name": "Test CRT", "heavy": False, "relpath": "",
-            "file": "", "params": []}
-        plugin._resolve_relpath = lambda preset, cfg: "deckycrt/crt.fx"
-        mod.shutil.which = (lambda name: "/usr/bin/xprop"
-                            if name == "xprop" else None)
-        mod.asyncio.sleep = no_wait
-
-        res = run(plugin.set_global_enabled(True))
-        check("enable survives a stale first read", res["ok"], True)
-        check("enable records confirmed live state",
-              plugin._load_config()["global_enabled"], True)
-        check("enable writes the property once", len(writes), 1)
-
-        res = run(plugin.set_global_enabled(True))
-        check("repeating the same mode is idempotent", res["ok"], True)
-        check("repeat does not re-write the property", len(writes), 1)
-
-        res = run(plugin.set_global_enabled(False))
-        check("disable survives a stale first read", res["ok"], True)
-        check("disable records confirmed off state",
-              plugin._load_config()["global_enabled"], False)
-        check("disable writes an empty property", writes[-1], "")
-
-        res = run(plugin.set_global_enabled(False))
-        check("repeating Off is idempotent", res["ok"], True)
-        check("repeat Off does not re-write", len(writes), 2)
-
-        # An unreadable property must fail closed: never guess and write.
-        live["readable"] = False
-        before = list(writes)
-        res = run(plugin.set_global_enabled(True))
-        check("unreadable live state refuses the change", res["ok"], False)
-        check("unreadable live state writes nothing", writes, before)
-        live["readable"] = True
-
-        # A slider event queued while Off must not resurrect the filter.
-        before = list(writes)
-        res = run(plugin.set_param("aperture-grille", "scanline", 0.5,
-                                   reapply=True))
-        check("slider while Off writes no property", writes, before)
-    finally:
-        plugin._gamescope_displays = saved["displays"]
-        plugin._xprop = saved["xprop"]
-        plugin._preset_by_id = saved["preset"]
-        plugin._resolve_relpath = saved["resolve"]
-        mod.shutil.which = saved["which"]
-        mod.asyncio.sleep = saved["sleep"]
-
-    print("backend: wrapped-app probe failures fail closed")
-    original_run = mod.subprocess.run
-    try:
-        def timeout_ps(*args, **kwargs):
-            if args and args[0] == ["ps", "-eo", "args"]:
-                raise mod.subprocess.TimeoutExpired(args[0], 10)
-            return original_run(*args, **kwargs)
-        mod.subprocess.run = timeout_ps
-        probe = run(plugin.wrapped_running_apps())
-        check("timeout returns probe failure", probe["ok"], False)
-        check("timeout includes no guessed app IDs", probe["app_ids"], [])
-
-        def failed_ps(*args, **kwargs):
-            if args and args[0] == ["ps", "-eo", "args"]:
-                return types.SimpleNamespace(returncode=1, stdout="", stderr="denied")
-            return original_run(*args, **kwargs)
-        mod.subprocess.run = failed_ps
-        probe = run(plugin.wrapped_running_apps())
-        check("nonzero ps returns probe failure", probe["ok"], False)
-    finally:
-        mod.subprocess.run = original_run
-
     print("backend: crash detection parsers")
     # The real coredumpctl rows and command line that this was written against:
     # the per-game wrapper that took gamescope down when Risk of Rain Returns
     # was launched.
-    core_row = ("Tue 2026-10-13 19:03:11 ADT 23952 1000 1000 SIGSEGV "
-                "inaccessible /usr/bin/gamescope -")
-    session_row = ("Tue 2026-10-13 18:20:00 ADT 4674 1000 1000 SIGABRT "
-                   "missing /usr/bin/gamescope -")
     check("core row yields its pid", mod.Plugin._parse_core_line(core_row), "23952")
     check("a non-core row yields nothing",
           mod.Plugin._parse_core_line("No coredumps found."), None)
     check("session gamescope core still yields its pid",
           mod.Plugin._parse_core_line(session_row), "4674")
-
-    wrapped_cmd = (
-        "gamescope --reshade-effect deckycrt-community/rsretroarch/Shaders/"
-        "CRTLottes2.fx -- /usr/bin/steam-launch-wrapper -- /usr/bin/reaper "
-        "SteamLaunch AppId=1337520 -- /usr/bin/proton waitforexitandrun "
-        "/games/Risk of Rain Returns.exe")
     check("wrapper command line yields the app id",
           mod.Plugin._wrapper_appid_from_cmdline(wrapped_cmd), 1337520)
     check("the session compositor is not one of our wrappers",
@@ -298,6 +259,157 @@ def main():
           mod.Plugin._wrapper_appid_from_cmdline(
               "gamescope --reshade-effect /usr/share/other/x.fx -- "
               "SteamLaunch AppId=123"), None)
+
+    print("backend: crash scan fails closed")
+    # A game the scan can actually find: the registry is what ties a core to a
+    # wrapper we installed.
+    run(plugin.set_managed_app(app_id, "Risk of Rain Returns",
+                               "deckycrt/aperture-grille.fx", True, True))
+
+    probe.cores = mod.Unknown("coredumpctl list exited 1: denied")
+    res = run(plugin.check_wrapper_crashes())
+    check("a scan that could not run is not 'no crashes'", res["ok"], False)
+    check("the failure says why", "denied" in res["detail"], True)
+    check("a failed scan reports no crashes", res["crashes"], [])
+
+    # An unnamed core must not be recorded as seen, or it is never looked at
+    # again and the game stays unlaunchable.
+    probe.cores = mod.Ok(["23952"])
+    probe.cmdlines = {}
+    res = run(plugin.check_wrapper_crashes())
+    check("an unnamed core is not reported as a crash", res["crashes"], [])
+    check("an unnamed core is not marked seen",
+          "23952" in (plugin._load_config().get("crash_scan_seen") or []), False)
+
+    probe.cmdlines = {"23952": mod.Ok(wrapped_cmd)}
+    res = run(plugin.check_wrapper_crashes())
+    check("a named core for a managed game is reported",
+          [c["app_id"] for c in res["crashes"]], [1337520])
+    check("a named core carries the game name",
+          res["crashes"][0]["name"], "Risk of Rain Returns")
+    check("a classified core is marked seen",
+          "23952" in (plugin._load_config().get("crash_scan_seen") or []), True)
+    check("a seen core is not reported twice",
+          run(plugin.check_wrapper_crashes())["crashes"], [])
+    check("the scan asks for 3 days of cores", probe.core_since, "3 days ago")
+
+    print("backend: wrapped-app probe failures fail closed")
+    probe.running = mod.Unknown("ps timed out after 10 seconds")
+    res = run(plugin.wrapped_running_apps())
+    check("a timeout returns probe failure", res["ok"], False)
+    check("a timeout includes no guessed app IDs", res["app_ids"], [])
+    probe.running = mod.Unknown("ps exited 1: denied")
+    check("nonzero ps returns probe failure",
+          run(plugin.wrapped_running_apps())["ok"], False)
+    probe.running = mod.Ok([1337520])
+    res = run(plugin.wrapped_running_apps())
+    check("an answered probe reports its app ids",
+          (res["ok"], res["app_ids"]), (True, [1337520]))
+    probe.running = mod.Ok([])
+
+    print("backend: global-effect transitions")
+    probe.writes.clear()
+    probe.xprop_present = True
+    probe.displays_result = mod.Ok([":0"])
+    probe.effect = mod.Ok("")
+    probe.effect_stale = 1
+
+    res = run(plugin.set_global_enabled(True))
+    check("enable survives a stale first read", res["ok"], True)
+    check("enable records confirmed live state",
+          plugin._load_config()["global_enabled"], True)
+    check("enable writes the property once", len(probe.writes), 1)
+
+    res = run(plugin.set_global_enabled(True))
+    check("repeating the same mode is idempotent", res["ok"], True)
+    check("repeat does not re-write the property", len(probe.writes), 1)
+
+    res = run(plugin.set_global_enabled(False))
+    check("disable survives a stale first read", res["ok"], True)
+    check("disable records confirmed off state",
+          plugin._load_config()["global_enabled"], False)
+    check("disable writes an empty property", probe.writes[-1], "")
+
+    res = run(plugin.set_global_enabled(False))
+    check("repeating Off is idempotent", res["ok"], True)
+    check("repeat Off does not re-write", len(probe.writes), 2)
+
+    # An unreadable property must fail closed: never guess and write.
+    probe.effect = mod.Unknown("xprop: unable to open display :0")
+    before = list(probe.writes)
+    res = run(plugin.set_global_enabled(True))
+    check("unreadable live state refuses the change", res["ok"], False)
+    check("unreadable live state writes nothing", probe.writes, before)
+    probe.effect = mod.Ok("")
+
+    # A display list we cannot establish is another unanswerable question.
+    probe.displays_result = mod.Unknown("no X server socket found")
+    before = list(probe.writes)
+    probe.effect = mod.Ok("deckycrt/aperture-grille.fx")
+    res = run(plugin.set_global_enabled(True))
+    check("no reachable display refuses the change", res["ok"], False)
+    check("no reachable display writes nothing", probe.writes, before)
+    probe.displays_result = mod.Ok([":0"])
+
+    # A write that fails is not a success.
+    probe.effect = mod.Ok("")
+    before = list(probe.writes)
+    probe.write_effect = lambda display, value: mod.Unknown("xprop -set failed")
+    res = run(plugin.set_global_enabled(True))
+    check("a failed property write refuses the change", res["ok"], False)
+    check("a failed property write changes nothing", probe.writes, before)
+    probe.write_effect = FakeProbe.write_effect.__get__(probe)
+
+    # A slider event queued while Off must not resurrect the filter.
+    status_now = run(plugin.get_status())
+    preset_aperture = next(p for p in status_now["presets"]
+                           if p["id"] == "aperture-grille")
+    keys = [p["key"] for p in (preset_aperture.get("params") or [])]
+    before = list(probe.writes)
+    if keys:
+        res = run(plugin.set_param("aperture-grille", keys[0], 0.5,
+                                   reapply=True))
+        check("a slider change is accepted", res["ok"], True)
+        check("slider while Off writes no property", probe.writes, before)
+    else:
+        check("aperture-grille exposes at least one slider param",
+              keys, ["<none>"])
+
+    print("backend: the production probe adapter")
+    # The adapter's own failure handling, driven through its internal `run`
+    # and `which` rather than by assigning module globals.
+    always_which = lambda name: "/usr/bin/" + name
+    no_which = lambda name: None
+
+    def timed_out_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(args[0], 10)
+
+    check("a missing coredumpctl is an answer, not unknown",
+          SystemProbe(run=timed_out_run, which=no_which).core_dumps("3 days ago"),
+          mod.Ok([]))
+    check("a timed-out ps is Unknown, not an empty list",
+          isinstance(SystemProbe(run=timed_out_run, which=always_which)
+                     .running_wrapped_apps(), mod.Unknown), True)
+    check("a failed coredumpctl list is Unknown",
+          isinstance(SystemProbe(
+              run=lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "denied"),
+              which=always_which).core_dumps("3 days ago"), mod.Unknown), True)
+    check("gamescope with no reshade support is a real answer",
+          SystemProbe(
+              run=lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "usage: gamescope", ""),
+              which=always_which).reshade_supported(), mod.Ok(False))
+    check("a missing gamescope binary is a real answer",
+          SystemProbe(run=timed_out_run, which=no_which).reshade_supported(),
+          mod.Ok(False))
+    check("a gamescope --help that cannot run is Unknown",
+          isinstance(SystemProbe(run=timed_out_run, which=always_which)
+                     .reshade_supported(), mod.Unknown), True)
+    check("a ps listing is parsed into app ids",
+          SystemProbe(
+              run=lambda *a, **k: subprocess.CompletedProcess(a[0], 0, wrapped_cmd + "\n", ""),
+              which=always_which).running_wrapped_apps(), mod.Ok([1337520]))
+    check("the plugin's default probe is the production adapter",
+          isinstance(mod.Plugin().probe, SystemProbe), True)
     check("running-wrapper probe returns a list",
           isinstance(run(mod.Plugin().wrapped_running_apps()).get("app_ids"), list), True)
 

@@ -14,8 +14,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The gate matters more than the package manager: pnpm is not installed on
+# every machine this repo is worked on, and that is not a reason to skip it.
+if command -v pnpm >/dev/null 2>&1; then
+  tsc_gate() { pnpm exec tsc --noEmit; }
+  build() { pnpm run build >/dev/null; }
+else
+  tsc_gate() { npx --no-install tsc --noEmit; }
+  build() { npm run build >/dev/null; }
+fi
+
 echo "== python syntax =="
-python3 -m py_compile main.py && echo "   main.py OK"
+python3 -m py_compile main.py deckycrt_probe.py && echo "   main.py + deckycrt_probe.py OK"
 
 echo "== launch-option unit tests =="
 node scripts/test-launch-options.ts
@@ -24,11 +34,11 @@ echo "== backend harness (stubbed decky, throwaway home) =="
 python3 scripts/test-backend.py | sed 's/^/   /'
 
 echo "== typescript (gate) =="
-pnpm exec tsc --noEmit
+tsc_gate
 echo "   tsc clean"
 
 echo "== build =="
-pnpm run build >/dev/null
+build
 FIRST=$(sha256sum dist/index.js | cut -d' ' -f1)
 echo "   dist/index.js $FIRST"
 
@@ -40,7 +50,7 @@ done
 
 echo "== rebuild reproducibility =="
 cp dist/index.js /tmp/deckycrt-dist-check.js
-pnpm run build >/dev/null
+build
 if cmp -s dist/index.js /tmp/deckycrt-dist-check.js; then
   echo "   reproducible (same bytes on a second build)"
 else

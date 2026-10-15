@@ -20,12 +20,27 @@ import os
 import pwd
 import re
 import shutil
-import subprocess
+import sys
 import tempfile
 import urllib.request
 import zipfile
 
 import decky
+
+# Decky loads main.py by path, so the sibling probe module is not guaranteed to
+# be importable: put this file's directory on sys.path first.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from deckycrt_probe import (  # noqa: E402 - must follow the sys.path fix
+    Ok,
+    SystemProbe,
+    Unknown,
+    parse_core_line,
+    parse_effect_property,
+    wrapper_appid_from_cmdline,
+)
 
 PLUGIN_SLUG = "deckycrt"
 CONFIG_PATH_REL = os.path.join(".config", PLUGIN_SLUG, "config.json")
@@ -288,10 +303,13 @@ DEFAULT_CONFIG = {
 
 
 class Plugin:
-    def __init__(self):
+    def __init__(self, probe=None):
         # A toggle and a shader reapply must not race on Gamescope's one effect
         # property. This is per backend instance and local to this plugin.
         self._effect_lock = asyncio.Lock()
+        # Everything that asks the system a question goes through here, so a
+        # test can hand this a scripted adapter instead of assigning privates.
+        self.probe = probe or SystemProbe()
 
     # ------------------------------------------------------------------ paths
     @property
@@ -738,94 +756,30 @@ class Plugin:
         decky.logger.info("DeckyCRT/panel: %s", str(message)[:400])
         return {"ok": True, "detail": ""}
 
-    @staticmethod
-    def _parse_core_line(line: str) -> str | None:
-        """PID from a `coredumpctl list` row, or None if it is not a core row.
+    # The parsers live beside the commands they parse (deckycrt_probe) and are
+    # re-exported here, so a caller of main.py need not know where they moved.
+    _parse_core_line = staticmethod(parse_core_line)
+    _wrapper_appid_from_cmdline = staticmethod(wrapper_appid_from_cmdline)
 
-        The timestamp has a variable number of words (weekday, date, time,
-        timezone), so the PID is matched as the number preceding the three
-        numeric columns that follow it, not by position.
-        """
-        m = re.search(r"\b(\d{1,7})\s+\d+\s+\d+\s+SIG[A-Z]+\b", line)
-        return m.group(1) if m else None
-
-    @staticmethod
-    def _wrapper_appid_from_cmdline(cmdline: str) -> int | None:
-        """App id when a gamescope command line is one of OUR per-game wrappers."""
-        if "--reshade-effect" not in cmdline or "deckycrt" not in cmdline:
-            return None
-        m = re.search(r"AppId=(\d+)", cmdline)
-        return int(m.group(1)) if m else None
-
-    def _wrapped_running_apps(self) -> list | None:
+    async def wrapped_running_apps(self) -> dict:
         """Apps running RIGHT NOW under our nested gamescope.
 
         This is how the panel can tell "the per-game filter is live in this
         process" from "a wrapper is merely saved for next launch" — the two
         look identical in Steam's saved options, and only the first one means
         system-wide would filter the same pixels twice.
-        """
-        found = set()
-        try:
-            p = subprocess.run(["ps", "-eo", "args"], capture_output=True,
-                               text=True, timeout=10, check=False)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            decky.logger.error("DeckyCRT: wrapped-app probe failed: %s", e)
-            return None
-        if p.returncode != 0:
-            decky.logger.error("DeckyCRT: wrapped-app probe exited %s: %s",
-                               p.returncode, (p.stderr or "")[:200])
-            return None
-        for line in p.stdout.splitlines():
-            app_id = self._wrapper_appid_from_cmdline(line)
-            if app_id is not None:
-                found.add(app_id)
-        return sorted(found)
 
-    async def wrapped_running_apps(self) -> dict:
-        app_ids = self._wrapped_running_apps()
-        if app_ids is None:
+        Fails closed: an unanswerable probe reports ok=False, because guessing
+        "none running" is exactly what stacks the two filters.
+        """
+        result = self.probe.running_wrapped_apps()
+        if isinstance(result, Unknown):
+            decky.logger.error("DeckyCRT: wrapped-app probe unknown: %s",
+                               result.reason)
             return {"ok": False,
                     "detail": "Could not determine whether a wrapped game is running.",
                     "app_ids": []}
-        return {"ok": True, "app_ids": app_ids}
-
-    def _gamescope_core_pids(self, since: str) -> list:
-        if not shutil.which("coredumpctl"):
-            return []
-        try:
-            p = subprocess.run(["coredumpctl", "list", "--no-pager",
-                                "--since", since],
-                               capture_output=True, text=True, timeout=25)
-        except (OSError, subprocess.TimeoutExpired):
-            return []
-        pids = []
-        for line in p.stdout.splitlines():
-            if "gamescope" not in line:
-                continue
-            pid = self._parse_core_line(line)
-            if pid:
-                pids.append(pid)
-        return pids
-
-    def _core_cmdline(self, pid: str) -> str:
-        try:
-            p = subprocess.run(["coredumpctl", "info", pid, "--no-pager"],
-                               capture_output=True, text=True, timeout=25)
-        except (OSError, subprocess.TimeoutExpired):
-            return ""
-        lines = p.stdout.splitlines()
-        for i, line in enumerate(lines):
-            if "Command Line:" not in line:
-                continue
-            chunk = [line.split("Command Line:", 1)[1]]
-            # The command line can wrap; stop at the next field.
-            for nxt in lines[i + 1:]:
-                if ":" in nxt and nxt.strip().split(":", 1)[0].isalpha():
-                    break
-                chunk.append(nxt)
-            return " ".join(chunk)
-        return ""
+        return {"ok": True, "app_ids": result.value}
 
     async def check_wrapper_crashes(self) -> dict:
         """Detect a game whose launch died with gamescope and report it.
@@ -835,20 +789,38 @@ class Plugin:
         user as "this game will not launch any more". The core dump names both
         the wrapper and the app id, so the panel can strip exactly the wrapper
         that is doing it instead of leaving the game unlaunchable.
+
+        Fails closed: a scan that could not run is *not* "no crashes". The user
+        would otherwise be left with a game that will not launch and no notice
+        that we never managed to look.
         """
         cfg = self._load_config()
         managed = cfg.get("managed_apps") or {}
         if not managed:
             return {"ok": True, "crashes": []}
+        found = self.probe.core_dumps("3 days ago")
+        if isinstance(found, Unknown):
+            decky.logger.error("DeckyCRT: core-dump scan unknown: %s",
+                               found.reason)
+            return {"ok": False,
+                    "detail": ("Could not read the core dump list: "
+                               + found.reason[:200]),
+                    "crashes": []}
         seen = {str(x) for x in (cfg.get("crash_scan_seen") or [])}
         crashes = []
-        new_pids = []
-        for pid in self._gamescope_core_pids("3 days ago"):
+        classified = []
+        unnamed = 0
+        for pid in found.value:
             if pid in seen:
                 continue
-            new_pids.append(pid)
-            cmdline = self._core_cmdline(pid)
-            app_id = self._wrapper_appid_from_cmdline(cmdline)
+            cmdline = self.probe.core_cmdline(pid)
+            if isinstance(cmdline, Unknown):
+                # Do not record it as seen: a core we could not name must be
+                # retried on the next mount, not forgotten.
+                unnamed += 1
+                continue
+            classified.append(pid)
+            app_id = wrapper_appid_from_cmdline(cmdline.value)
             if app_id is None or str(app_id) not in managed:
                 continue
             entry = managed[str(app_id)]
@@ -857,14 +829,18 @@ class Plugin:
                 "name": entry.get("name") or f"App {app_id}",
                 "shader": entry.get("relpath") or "",
             })
-        if new_pids:
-            cfg["crash_scan_seen"] = (sorted(seen | set(new_pids)))[-50:]
+        if classified:
+            cfg["crash_scan_seen"] = (sorted(seen | set(classified)))[-50:]
             self._save_config(cfg)
         if crashes:
             decky.logger.error(
                 "DeckyCRT: gamescope crashed launching %s under a per-game "
                 "wrapper; the wrapper should be removed",
                 ", ".join(str(c["app_id"]) for c in crashes))
+        if unnamed:
+            decky.logger.error(
+                "DeckyCRT: %s core dump(s) could not be named and will be "
+                "checked again next mount", unnamed)
         return {"ok": True, "crashes": crashes}
 
     async def set_managed_app(self, app_id: int, name: str, relpath: str,
@@ -925,7 +901,7 @@ class Plugin:
         return {
             "reshade_supported": self._gamescope_reshade_supported(),
             "xprop_available": self._xprop_available(),
-            "displays": self._x11_displays(),
+            "displays": self._display_list(),
             "shaders_installed": shaders_installed,
             "heavy_installed": bool(cfg.get("heavy_relpath")),
             "global_enabled": (None if live_effect is None else bool(live_effect)),
@@ -942,126 +918,53 @@ class Plugin:
         }
 
     def _gamescope_reshade_supported(self) -> bool:
-        gs = shutil.which("gamescope")
-        if not gs:
+        result = self.probe.reshade_supported()
+        if isinstance(result, Unknown):
+            decky.logger.error("DeckyCRT: reshade support probe unknown: %s",
+                               result.reason)
             return False
-        try:
-            p = subprocess.run([gs, "--help"], capture_output=True, text=True,
-                               timeout=15)
-            out = (p.stdout + p.stderr).lower()
-            return "reshade" in out
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+        return result.value
 
-    def _x11_displays(self) -> list:
-        d = "/tmp/.X11-unix"
-        out = []
-        try:
-            for name in os.listdir(d):
-                if name.startswith("X") and name[1:].isdigit():
-                    out.append(":" + name[1:])
-        except OSError:
-            pass
-        return out
+    def _display_list(self) -> list:
+        """Gamescope displays, or [] when that could not be established.
 
-    def _display_owner(self, display: str) -> str | None:
-        """User that owns this X server's socket.
-
-        The session's X server authorises the session user by local identity
-        (SI:localuser:<user>) and there is typically no cookie file, so a
-        root-owned process must run X clients as that same user.
+        Every caller reads [] as "no global mode is reachable" and refuses the
+        change, so an unanswerable probe cannot silently write nowhere.
         """
-        num = display.lstrip(":") or "0"
-        try:
-            return pwd.getpwuid(
-                os.stat(f"/tmp/.X11-unix/X{num}").st_uid).pw_name
-        except (OSError, KeyError):
-            return None
+        result = self.probe.displays()
+        if isinstance(result, Unknown):
+            decky.logger.error("DeckyCRT: display probe unknown: %s",
+                               result.reason)
+            return []
+        return result.value
 
-    def _xprop(self, display: str, *args: str):
-        env = dict(os.environ)
-        env["DISPLAY"] = display
-        cmd = ["xprop", "-root", *args]
-        # Decky's loader runs as root; the session's X server only authorises
-        # the session user, so run xprop as them (DISPLAY is set inside the
-        # command because runuser resets the environment).
-        if os.geteuid() == 0:
-            owner = self._display_owner(display)
-            if owner and owner != "root":
-                cmd = ["runuser", "-u", owner, "--", "env",
-                       f"DISPLAY={display}", *cmd]
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=10, env=env)
-            return p.returncode, (p.stdout + p.stderr).strip()
-        except (OSError, subprocess.TimeoutExpired) as e:
-            return 1, str(e)
-
-    def _gamescope_displays(self) -> list:
-        """Displays that really carry Gamescope's reshade property.
-
-        Other Xwayland servers in the session answer xprop but have no
-        GAMESCOPE_* properties, so writing to them silently does nothing.
-        """
-        found = []
-        for display in self._x11_displays():
-            rc, out = self._xprop(display, "-notype",
-                                  "GAMESCOPE_RESHADE_EFFECT")
-            if rc == 0 and "not found" not in out:
-                found.append(display)
-        return found
-
-    @staticmethod
-    def _parse_effect_property(output: str) -> tuple[bool, str]:
-        """Parse xprop output; distinguish empty from unreadable/unparseable."""
-        if "no such atom" in output.lower():
-            return True, ""
-        # xprop -notype emits `NAME = "/path.fx"`; typed xprop emits
-        # `NAME(STRING) = "/path.fx"`. Empty values appear as `NAME = ` or
-        # `NAME(STRING) = ` (sometimes with quotes).
-        match = re.search(
-            r'GAMESCOPE_RESHADE_EFFECT(?:\([^)]*\))?\s*=\s*(?:"([^"]*)")?\s*$',
-            output.strip(), re.IGNORECASE)
-        if match:
-            return True, match.group(1) or ""
-        return False, ""
+    _parse_effect_property = staticmethod(parse_effect_property)
 
     def _live_global_effect(self) -> str | None:
         """Return the exact live effect path; None means unreadable."""
-        displays = self._gamescope_displays()
-        if not displays:
-            return None
-        for display in displays:
-            rc, output = self._xprop(display, "-notype",
-                                     "GAMESCOPE_RESHADE_EFFECT")
-            if rc != 0:
-                continue
-            readable, effect = self._parse_effect_property(output)
-            if readable:
-                return effect
+        for display in self._display_list():
+            result = self.probe.read_effect(display)
+            if isinstance(result, Ok):
+                return result.value
+            decky.logger.error("DeckyCRT: effect read failed on %s: %s",
+                               display, result.reason)
         return None
-
 
     async def _read_effect_until(self, expected: str, displays: list) -> tuple[bool, str]:
         """Poll readback: xprop's write can precede Gamescope's render tick."""
         last = ""
         for attempt in range(16):
-            readable_any = False
+            answered = False
             for display in displays:
-                rc, output = self._xprop(display, "-notype",
-                                         "GAMESCOPE_RESHADE_EFFECT")
-                if rc != 0:
-                    last = output
+                result = self.probe.read_effect(display)
+                if isinstance(result, Unknown):
+                    last = result.reason
                     continue
-                readable, observed = self._parse_effect_property(output)
-                if not readable:
-                    last = f"{display}: unparseable property readback: {output}"
-                    continue
-                readable_any = True
-                if observed == expected:
+                answered = True
+                if result.value == expected:
                     return True, display
-                last = f"{display}: still {observed!r}"
-            if attempt < 15 and readable_any:
+                last = f"{display}: still {result.value!r}"
+            if attempt < 15 and answered:
                 await asyncio.sleep(0.125)
         return False, last
 
@@ -1073,21 +976,19 @@ class Plugin:
         relpath = self._resolve_relpath(preset, cfg) if preset else ""
         if enabled and not relpath:
             return {"ok": False, "detail": "No shader installed for this preset."}
-        if shutil.which("xprop") is None:
+        if not self.probe.xprop_installed():
             return {"ok": False,
                     "detail": "xprop is not installed; global mode unavailable."}
-        displays = self._gamescope_displays()
+        displays = self._display_list()
         if not displays:
             return {"ok": False,
                     "detail": "No Gamescope display reachable over xprop."}
         expected = relpath if enabled else ""
         last_error = ""
         for display in displays:
-            rc, output = self._xprop(
-                display, "-f", "GAMESCOPE_RESHADE_EFFECT", "8s", "-set",
-                "GAMESCOPE_RESHADE_EFFECT", expected)
-            if rc != 0:
-                last_error = output
+            written = self.probe.write_effect(display, expected)
+            if isinstance(written, Unknown):
+                last_error = written.reason
                 continue
             matched, observed = await self._read_effect_until(expected, displays)
             if not matched:
@@ -1128,8 +1029,8 @@ class Plugin:
         return await self._set_global_enabled_impl(enabled)
 
     def _xprop_available(self) -> bool:
-        return (shutil.which("xprop") is not None
-                and bool(self._gamescope_displays()))
+        return (self.probe.xprop_installed()
+                and bool(self._display_list()))
 
     # ------------------------------------------------------------------ apply
     async def set_preset(self, preset_id: str) -> dict:

@@ -233,7 +233,17 @@ function Content() {
       toastError("Wrapper crash check", e);
       return false;
     }
-    if (!res?.crashes?.length) return false;
+    if (!res?.crashes?.length) {
+      // A scan that could not run is not "no crashes". Staying silent here is
+      // how a game sits unlaunchable while every check reports all clear.
+      if (res && res.ok === false) {
+        diag(`crash scan could not run: ${res.detail ?? "no detail"}`);
+        toast(
+          "Couldn't check whether a saved CRT wrapper is stopping a game from launching — see the plugin log."
+        );
+      }
+      return false;
+    }
     const rel = shaderPathFor(s);
     const cleaned: string[] = [];
     const stuck: string[] = [];
