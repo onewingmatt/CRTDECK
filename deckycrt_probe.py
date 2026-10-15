@@ -36,8 +36,35 @@ COREDUMP_TIMEOUT = 25
 XPROP_TIMEOUT = 10
 GAMESCOPE_TIMEOUT = 15
 
+# Decky runs a plugin backend from a PyInstaller-bundled Python, which exports
+# the directory it unpacked itself into through LD_LIBRARY_PATH. Every system
+# binary this plugin then spawns loads the bundle's libcrypto/libssl instead of
+# the system's and dies before running its first instruction:
+#
+#   coredumpctl: /tmp/_MEI<id>/libcrypto.so.3: version `OPENSSL_3.4.0' not found
+#   (required by /usr/lib64/systemd/libsystemd-shared-259.9-1.fc44.so)
+#
+# That is not a tidy failure: it turned the crash guard — the path that decides
+# whether a game can still launch — into "unknown", and an unknown crash scan
+# looks the same as a clean one. Children get a clean loader environment.
+LEAKY_ENV_VARS = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH")
+
 PS_ARGS = ["ps", "-eo", "args"]
 EFFECT_PROPERTY = "GAMESCOPE_RESHADE_EFFECT"
+
+
+def child_env() -> dict:
+    """The environment a child process should see: ours, minus the bundle's."""
+    env = dict(os.environ)
+    for name in LEAKY_ENV_VARS:
+        env.pop(name, None)
+    return env
+
+
+def run_child(argv, **kwargs):
+    """subprocess.run with a clean loader environment for system binaries."""
+    kwargs.setdefault("env", child_env())
+    return subprocess.run(argv, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -98,7 +125,9 @@ class SystemProbe:
     """The production adapter. Every method answers or reports Unknown."""
 
     def __init__(self, run=None, which=None, x11=None, sockets=None):
-        self._run = run or subprocess.run
+        # run_child, not subprocess.run: the default runner has to strip Decky's
+        # bundle library path or every system binary fails to start here.
+        self._run = run or run_child
         self._which = which or shutil.which
         self._x11 = x11 if x11 is not None else deckycrt_x11
         # The X socket directory is a fact about the machine, so it is an

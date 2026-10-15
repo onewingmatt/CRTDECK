@@ -298,6 +298,37 @@ def main():
           run(plugin.check_wrapper_crashes())["crashes"], [])
     check("the scan asks for 3 days of cores", probe.core_since, "3 days ago")
 
+    print("probe: children get a clean loader environment")
+    # Decky's bundled Python leaks LD_LIBRARY_PATH into every child process, so
+    # system binaries fail to start: coredumpctl died loading the bundle's
+    # libcrypto, which turned the crash guard into "unknown" — the one path that
+    # decides whether a game can still launch.
+    probe_mod = importlib.import_module("deckycrt_probe")
+    saved = {k: os.environ.get(k) for k in probe_mod.LEAKY_ENV_VARS}
+    os.environ["LD_LIBRARY_PATH"] = "/tmp/deckycrt-poison"
+    os.environ["LD_PRELOAD"] = "/tmp/deckycrt-poison/libx.so"
+    os.environ["DECKYCRT_TEST_KEEP"] = "kept"
+    try:
+        env = probe_mod.child_env()
+        check("the bundle's library path is stripped",
+              env.get("LD_LIBRARY_PATH"), None)
+        check("the preload is stripped", env.get("LD_PRELOAD"), None)
+        check("nothing else is dropped", env.get("DECKYCRT_TEST_KEEP"), "kept")
+        out = probe_mod.run_child(["env"], capture_output=True, text=True).stdout
+        check("a real child sees no LD_LIBRARY_PATH",
+              "LD_LIBRARY_PATH=" in out, False)
+        check("a real child still sees the environment",
+              "DECKYCRT_TEST_KEEP=kept" in out, True)
+        check("the probe's default runner is the sanitizing one",
+              probe_mod.SystemProbe()._run, probe_mod.run_child)
+    finally:
+        for name in probe_mod.LEAKY_ENV_VARS:
+            os.environ.pop(name, None)
+        os.environ.pop("DECKYCRT_TEST_KEEP", None)
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
+
     print("backend: wrapped-app probe failures fail closed")
     probe.running = mod.Unknown("ps timed out after 10 seconds")
     res = run(plugin.wrapped_running_apps())
