@@ -8,15 +8,19 @@
 //
 // Why the patterns are locked to a source line count and not to the output
 // grid. This box drives 3840x2160. A scanline period of two OUTPUT rows is
-// 1080 dark rows across the picture, well below what the eye resolves from the
-// couch, so it reads as a flat grey veil rather than as scanlines; and a triad
-// of three OUTPUT columns sits at the panel's own stripe pitch, where it beats
-// against the panel and shimmers as coloured noise. Both patterns therefore
-// scale with the tube being emulated. SourceLines is how many scanlines that
-// tube had — 240 for a 15 kHz set, 224 for an arcade monitor, 272 for the
-// PPSSPP CRT shader, 480 for a PVM. It is also why the community RetroCRT
-// shader is the one that looks closest to right on this machine: it hardcodes
-// 272 lines, and the bundled set never had the knob.
+// 1080 dark rows across the picture, below what the eye resolves from a couch,
+// so it reads as a flat grey veil rather than as scanlines. A triad of three
+// OUTPUT columns lands at the 4K panel's own stripe pitch, where it is likewise
+// too fine to perceive as a mask — it contributes dimming and colour fringing
+// on high-contrast edges but no grille, and any scaling in the chain (an
+// upscaled game, a non-1:1 output) makes its phase drift against the panel's
+// stripes. Both patterns therefore scale with the tube being emulated, which is
+// the rule the reference CRT shaders follow: the mask pitch follows the SOURCE
+// pixel, not the display pixel. SourceLines is how many scanlines that tube had
+// — 240 for a 15 kHz set, 224 for an arcade monitor, 272 for the PPSSPP CRT
+// shader, 480 for a PVM. It is also why the community RetroCRT shader is the one
+// that looked closest to right on this machine: it hardcodes 272 lines, and the
+// bundled set never had the knob.
 //
 // The pattern functions take coordinates as arguments (output pixels, and 0..1
 // uv for the beam) so their geometry can be reasoned about and tested from
