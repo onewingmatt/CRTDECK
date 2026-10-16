@@ -771,7 +771,9 @@ function Content() {
         {currentPreset?.params
           ? currentPreset.params
               .filter(paramIsUsable)
-              .slice(0, 12)
+              // CRT Pro exposes 24 options; the slice is a guard against a
+              // runaway list, not a limit worth hitting.
+              .slice(0, 40)
               .map((param) => (
                 <SliderField
                   key={param.key}

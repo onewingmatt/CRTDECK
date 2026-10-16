@@ -65,9 +65,108 @@ COMMUNITY_HEADER = "ReShade.fxh"
 # line 1 with "could not open included file". Bundled so packs install offline.
 COMMUNITY_HEADER_URL = ("https://raw.githubusercontent.com/crosire/"
                         "reshade-shaders/master/Shaders/ReShade.fxh")
-# Bump when _parse_uniforms' range rules change: stored community params were
-# derived by the old rules and would otherwise keep poisoning the panel.
-PARAMS_REV = 2
+# Gamescope's compile verdict for every community shader, measured on this box
+# (see community/verdicts.json). Shipped, not measured at runtime: the compiler
+# is only reachable by applying a shader to a session, and doing that to find out
+# which ones are dead is exactly the crash opportunity the plugin avoids.
+VERDICT_PATH_REL = os.path.join("community", "verdicts.json")
+# Bump when _parse_uniforms' range OR selection rules change: stored community
+# params were derived by the old rules and would otherwise keep poisoning the
+# panel.
+PARAMS_REV = 3
+# How many of a community shader's parameters the panel shows. CRT-Guest-Advanced
+# declares 129; nobody wants 129 sliders in a couch UI, so the useful ones win.
+COMMUNITY_PARAM_LIMIT = 24
+# Which of a community shader's parameters the panel shows when it declares more
+# than COMMUNITY_PARAM_LIMIT. A shader's OWN declaration order is not a priority
+# order: CRT-Guest-Advanced declares 129 parameters and starts with persistence
+# and 3D LUT selects, so the first ten it used to hand over were the ten that
+# cannot work here (persistence needs the previous frame; the LUT selects need
+# textures this plugin does not ship). Ten of those is what "CRT Pro doesn't have
+# the options I'd like" looked like from the user's side.
+#
+# These groups ARE a priority order, matched on the label and the key, with the
+# shader's own order kept inside each group. The inert list wins outright, so a
+# substring can only ever downgrade a parameter: "Afterglow Strength" contains
+# "glow" but is inert here, and "Interlacing Scanlines" contains "scanline" but
+# needs a field sequence no panel produces.
+_PARAM_GROUPS = (
+    ("mask", ("shadow_msk", "maskstr", "masksize", "mask_zoom", "mshift",
+              "mask_layout", "mask_drk", "mask_lgt", "mask_gamma", "grille",
+              "slot", "phosphor", "aperture", "mask")),
+    ("scanlines", ("scanline1", "scanline2", "beam_min", "beam_max",
+                   "beam_size", "scangamma", "scan_falloff", "spike", "gsl",
+                   "scanline", "beam")),
+    ("glow", ("blm_1", "blm_2", "halation", "h_mask", "mask_bloom", "glow",
+              "bloom")),
+    ("geometry", ("warpx", "warpy", "c_shape", "curvature", "overscanx",
+                  "overscany", "overscan", "zoom_mask", "warp", "zoom",
+                  "shape")),
+    ("frame", ("csize", "bsize", "sborder", "vigstr", "vigdef", "corner",
+               "border", "vignette")),
+    ("colour", ("gamma_i", "gamma_o", "pre_bb", "contra", "wp_saturation",
+                "gamma", "bright", "contrast", "saturat", "black", "color",
+                "level")),
+    ("sharpness", ("h_sharp", "s_sharp", "smart_ei", "ring", "sharpen",
+                   "sharp", "smooth", "blur")),
+    ("convergence", ("deconrx", "decongx", "deconbx", "deconry", "decongy",
+                     "deconby", "convergence", "aberration", "fringing")),
+    ("scale", ("masksize", "size", "width", "height", "scale", "taps")),
+)
+# Options that cannot do anything under Gamescope, whatever the shader.
+_PARAM_INERT = ("lut", "gamut", "profile", "persistence", "afterglow", "noise",
+                "debug", "tate", "integer", "interlac", "field", "vga")
+# How many are taken from each group before the next group gets a turn. Three
+# keeps any one family (CRT-Guest-Advanced has 23 mask parameters) from filling
+# the panel on its own.
+PARAMS_PER_GROUP = 3
+
+
+def _select_params(params: list, limit: int) -> list:
+    """The best `limit` parameters: a spread over the groups, in priority order.
+
+    A straight sort by interest would fill the list from the mask family alone
+    and never show a curvature or a gamma slider; taking the shader's first
+    `limit` is how the panel ended up offering ten inert ones. The chosen
+    parameters keep the shader's own order, so a familiar shader still reads the
+    way its author laid it out.
+    """
+    if limit <= 0 or len(params) <= limit:
+        return params
+    hay = [(f"{param['key']} {param['label']}".lower(), i)
+           for i, param in enumerate(params)]
+    inert = {i for text, i in hay if any(w in text for w in _PARAM_INERT)}
+    chosen: set = set()
+    for _name, words in _PARAM_GROUPS:
+        if len(chosen) >= limit:
+            break
+        # Within a group the more specific word wins, so a shader that has both
+        # a "Mask Strength" and a "Bloom Mask Strength" gives up the phosphor
+        # mask first: the words are an order, not a set.
+        group = []
+        for text, i in hay:
+            if i in inert or i in chosen:
+                continue
+            for rank, word in enumerate(words):
+                if word in text:
+                    group.append((rank, i))
+                    break
+        group.sort()
+        for _rank, i in group[:PARAMS_PER_GROUP]:
+            if len(chosen) >= limit:
+                break
+            chosen.add(i)
+    # Anything still missing comes from what is left, neutrals first and the
+    # inert ones only when a shader has nothing else at all.
+    for pool in ([i for _t, i in hay if i not in chosen and i not in inert],
+                 [i for _t, i in hay if i not in chosen]):
+        for i in pool:
+            if len(chosen) >= limit:
+                break
+            chosen.add(i)
+    return [params[i] for i in sorted(chosen)]
+
+
 COMMUNITY_PACKS = [
     {
         "id": "rsretroarch",
@@ -297,18 +396,48 @@ PRESETS = [
         "file": LIGHT_SUBDIR + "/crt-pro.fx",
         "heavy": False,
         "params": [
-            _param("ScanIntensity", "Scanline intensity", 0.35),
-            _param("MaskStrength", "Grille strength", 0.18),
-            _param("MaskScale", "Grille pitch (x source pixel)", 1.0,
-                   minv=1.0, maxv=3.0, step=0.05),
-            _param("BeamWidth", "Beam width", 0.50, minv=0.05, maxv=0.90,
-                   step=0.01),
-            _param("GlowAmount", "Glow", 0.30),
-            _param("Curvature", "Screen curvature", 0.10, maxv=0.30,
-                   step=0.01),
-            _param("Vignette", "Vignette", 0.20),
+            _param("SourceLines", "Beam · source lines", 240, minv=120, maxv=540,
+                   step=1),
+            _param("ScanIntensity", "Beam · scanline depth", 0.35),
+            _param("BeamWidth", "Beam · beam width", 0.50, minv=0.05, maxv=0.95,
+                   step=0.05),
+            _param("BeamSoftness", "Beam · softness", 1.00, minv=0.20,
+                   maxv=4.00, step=0.05),
+            _param("MaskType", "Mask · type 0-3 (off/grille/slot/dot)", 1.0,
+                   maxv=3.0, step=1.0),
+            _param("MaskStrength", "Mask · strength", 0.18, step=0.02),
+            _param("MaskScale", "Mask · pitch x source pixel", 1.0, minv=1.0,
+                   maxv=3.0, step=0.05),
+            _param("MaskGamma", "Mask · gamma", 1.00, minv=0.25, maxv=3.00,
+                   step=0.05),
+            _param("GlowAmount", "Glow · halation", 0.30),
+            _param("GlowX", "Glow · width X (source px)", 3.0, maxv=12.0,
+                   step=0.5),
+            _param("GlowY", "Glow · width Y (source px)", 3.0, maxv=12.0,
+                   step=0.5),
+            _param("GlowThreshold", "Glow · threshold", 0.0, maxv=0.90,
+                   step=0.05),
             _param("Sharpness", "Sharpness", 0.25),
-            _source_lines(),
+            _param("Convergence", "Convergence (RGB split)", 0.50, maxv=3.0,
+                   step=0.05),
+            _param("CurvatureX", "Screen · curve X", 0.10, maxv=0.30,
+                   step=0.01),
+            _param("CurvatureY", "Screen · curve Y", 0.10, maxv=0.30,
+                   step=0.01),
+            _param("Vignette", "Screen · vignette", 0.20),
+            _param("CornerSize", "Screen · corner round", 0.0, maxv=0.35,
+                   step=0.01),
+            _param("Overscan", "Screen · overscan", 0.0, maxv=0.20,
+                   step=0.01),
+            _param("Brightness", "Color · brightness", 1.00, minv=0.50,
+                   maxv=1.50, step=0.01),
+            _param("Gamma", "Color · gamma", 1.00, minv=0.50, maxv=2.50,
+                   step=0.05),
+            _param("BlackLevel", "Color · black level", 0.0, minv=-0.20,
+                   maxv=0.20, step=0.01),
+            _param("Saturation", "Color · saturation", 1.00, maxv=2.00,
+                   step=0.05),
+            _param("ColorTemp", "Color · warm/cool", 0.50, step=0.05),
         ],
     },
     {
@@ -320,6 +449,40 @@ PRESETS = [
         "params": [],
     },
 ]
+
+# The order the panel shows presets in: best first, because a fifteen-way
+# dropdown with no order in it is a wall of names and the good ones are not
+# distinguishable from the dead ones. Lower rank sorts first.
+#
+# The rule, so it can be argued with rather than guessed at:
+#   10-90   complete tube emulations, most complete/faithful first
+#   100-140 the character pieces and the bare utilities
+#   150     the heavy/experimental tier (also needs a download)
+#   200+    community packs, by measured verdict: compiling shaders ahead of
+#           untested ones, and the ones Gamescope rejects last of all
+PRESET_RANK = {
+    "crt-pro": 10,          # halation, beam shape, three masks, full trims
+    "arcade": 20,           # heavy slot mask, curve, arcade line count
+    "slot-mask": 30,        # the full tube: slots, curvature, vignette
+    "pvm": 40,              # sharp broadcast monitor
+    "lottes": 50,           # the soft end of the family
+    "consumer-tv": 60,      # RF softness and colour bleed
+    "slot-mask-flat": 70,
+    "aperture-grille": 80,
+    "shadow-mask": 90,
+    "composite": 100,
+    "green-phosphor": 110,
+    "amber-phosphor": 120,
+    "bw-tv": 130,
+    "scanlines": 140,
+    "crt-royale": 150,
+}
+# Community shaders are ranked by the verdicts measured off-device
+# (community/verdicts.json) rather than by anyone's opinion of them.
+COMMUNITY_RANK_OK = 200
+COMMUNITY_RANK_UNTESTED = 210
+COMMUNITY_RANK_REJECT = 220
+DEFAULT_RANK = 500
 
 DEFAULT_CONFIG = {
     "global_enabled": False,
@@ -501,7 +664,7 @@ class Plugin:
         s = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
         return s.replace("_", " ").replace("-", " ").strip()
 
-    def _parse_uniforms(self, text: str, limit: int = 10) -> list:
+    def _parse_uniforms(self, text: str, limit: int = COMMUNITY_PARAM_LIMIT) -> list:
         """Extract tunable float uniforms from a ReShade .fx file.
 
         The range matters as much as the value: every parameter is rendered as
@@ -556,9 +719,7 @@ class Plugin:
             label = self._ann_str(ann, "ui_label") or self._prettify(key)
             params.append({"key": key, "label": label, "min": round(lo, 6),
                            "max": round(hi, 6), "step": step, "default": dflt})
-            if len(params) >= limit:
-                break
-        return params
+        return _select_params(params, limit)
 
     async def download_pack(self, pack_id: str) -> dict:
         pack = next((x for x in COMMUNITY_PACKS if x["id"] == pack_id), None)
@@ -922,10 +1083,57 @@ class Plugin:
         self._save_config(cfg)
         return {"ok": True, "detail": "Tracking cleared."}
 
+    # ------------------------------------------------------------ preset order
+    def _shader_verdicts(self) -> dict:
+        """Gamescope's compile verdict per community shader, as measured.
+
+        A rejected shader is silent: the property write succeeds, the effect
+        never loads, and the preset does nothing at all. The registry ships with
+        the plugin so the list can put the shaders that work first instead of
+        leaving the user to discover the dead ones one at a time.
+        """
+        for base in (self._plugin_dir,
+                     os.path.dirname(os.path.abspath(__file__))):
+            try:
+                with open(os.path.join(base, VERDICT_PATH_REL),
+                          encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except (OSError, ValueError):
+                continue
+        return {}
+
+    @staticmethod
+    def _verdict_for(relpath: str, verdicts: dict) -> str:
+        """ok | untested | reject for one shader path.
+
+        Matched on the path suffix: the registry records a path inside the
+        shader directory, while the config's relpath carries the plugin's own
+        subdirectory prefix.
+        """
+        rel = str(relpath or "")
+        if not rel:
+            return "untested"
+        for key in ("ok", "untested", "reject"):
+            for recorded in (verdicts.get(key) or {}):
+                if rel.endswith(recorded):
+                    return key
+        return "untested"
+
+    def _rank_of(self, entry: dict, verdicts: dict) -> int:
+        if not entry.get("community"):
+            return PRESET_RANK.get(entry.get("id"), DEFAULT_RANK)
+        return {"ok": COMMUNITY_RANK_OK,
+                "untested": COMMUNITY_RANK_UNTESTED,
+                "reject": COMMUNITY_RANK_REJECT}[
+                    self._verdict_for(entry.get("relpath", ""), verdicts)]
+
     # ------------------------------------------------------------------ status
     async def get_status(self) -> dict:
         cfg = self._load_config()
         live_effect = self._live_global_effect()
+        verdicts = self._shader_verdicts()
         presets = []
         for p in PRESETS:
             entry = dict(p)
@@ -933,10 +1141,30 @@ class Plugin:
             if p["heavy"] and not entry["relpath"]:
                 entry["relpath"] = ""
             presets.append(entry)
+        rejections = verdicts.get("reject")
+        if not isinstance(rejections, dict):
+            rejections = {}
         for cp in cfg.get("community_presets", []):
             entry = dict(cp)
             entry["community"] = True
+            relpath = str(entry.get("relpath", ""))
+            verdict = self._verdict_for(relpath, verdicts)
+            entry["verdict"] = verdict
+            if verdict == "reject":
+                # Say it where the preset is picked, not in a log nobody reads.
+                reason = next((msg for path, msg in rejections.items()
+                               if relpath.endswith(path)), "")
+                where = f" ({reason})" if reason else ""
+                entry["name"] = f"{entry.get('name', '')} — won't load"
+                entry["description"] = (
+                    f"Gamescope's shader compiler rejects this one{where}, so "
+                    "selecting it does nothing. It is listed last for that "
+                    "reason. " + str(entry.get("description", "")))
             presets.append(entry)
+        # One place decides the order, and the panel just renders it.
+        for entry in presets:
+            entry["rank"] = self._rank_of(entry, verdicts)
+        presets.sort(key=lambda e: (e["rank"], (e.get("name") or "").lower()))
         light_dir = os.path.join(self._shader_base, LIGHT_SUBDIR)
         shaders_installed = os.path.isdir(light_dir) and any(
             n.endswith(".fx") for n in os.listdir(light_dir))

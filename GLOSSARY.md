@@ -33,6 +33,17 @@ refuse the change and say why.
 
 **panel** — the Decky QAM interface (`src/index.tsx`).
 
+**preset rank** — the order the preset list is served in, best first. Owned by
+`PRESET_RANK` and by the measured verdicts for community shaders, so the order
+is a decision in one place rather than the order the list happens to be written
+in.
+
+**verdict** — what Gamescope's shader compiler did with a community shader when
+it was measured (`ok`, `reject`, `untested`), recorded in
+`community/verdicts.json`. A rejected shader is silent: the write succeeds, the
+effect never loads and the preset looks like it does nothing, so the list says
+so instead of letting the user find out one at a time.
+
 **backend** — `main.py`, which Decky's loader runs as the plugin's user.
 
 **the two filters must not stack** — a game running under its own wrapper keeps

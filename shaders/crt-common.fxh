@@ -61,12 +61,36 @@ float CrtScanMean(float scanIntensity, float gap)
     return 1.0 - scanIntensity * (1.0 - CrtBeamMean(gap));
 }
 
-// Barrel distortion around the centre. `uv` is 0..1 across the output.
-float2 CrtWarp(float2 uv, float curvature)
+// Barrel distortion around the centre, with independent X and Y curvature (a
+// real tube is not equally curved in both axes, and CRT-Guest-Advanced exposes
+// them separately for exactly that reason).
+float2 CrtWarp2(float2 uv, float2 curvature)
 {
     float2 c = uv * 2.0 - 1.0;
     c *= 1.0 + curvature * dot(c, c);
     return c * 0.5 + 0.5;
+}
+
+float2 CrtWarp(float2 uv, float curvature)
+{
+    return CrtWarp2(uv, float2(curvature, curvature));
+}
+
+// Beam profile with a shape control: `edge/gap` is uniform on [0,1] with
+// probability `gap` and saturates to 1 beyond it, so
+//     mean(pow(ramp, power)) = 1 - gap * power / (power + 1)
+// exactly, for any power. power < 1 gives a wide soft beam, power 1 a linear
+// ramp (the same mean as the smoothstep profile above), power > 1 a tight bright
+// core with wider dark gaps.
+float CrtBeamMeanPow(float gap, float power)
+{
+    float p = max(power, 0.05);
+    return 1.0 - max(gap, 0.001) * p / (p + 1.0);
+}
+
+float CrtScanMeanPow(float scanIntensity, float gap, float power)
+{
+    return 1.0 - scanIntensity * (1.0 - CrtBeamMeanPow(gap, power));
 }
 
 // 1 inside the warped tube, 0 outside it. Step products rather than a branch so

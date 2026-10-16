@@ -1,12 +1,35 @@
-// DeckyCRT :: CRT Pro — two-pass aperture-grille tube
+// DeckyCRT :: CRT Pro — the flagship, three passes
 //
-// The flagship: everything the single-pass presets do, plus halation. Pass 0
-// builds the glow source (the light a bright element throws onto the phosphor
-// around it); pass 1 is the tube — curvature, source-locked beam and grille,
-// glow filling the scanline gaps, chroma deconvergence, vignette.
+// Pass 0 bright-passes the frame and blurs it horizontally, pass 1 blurs that
+// vertically, pass 2 is the tube: geometry, beam, mask, halation, corners,
+// display trims.
 //
-// Written for Gamescope's reshadefx, which is a subset of ReShade FX. Every
-// idiom here was proven to compile on gamescope 3.16.31-ogc2+:
+// The option set is the useful half of CRT-Guest-Advanced's, which is the most
+// complete CRT shader in the field at 129 parameters. What was taken, and why:
+//
+//   beam       Guest exposes beam shape (scanline1/scanline2), and a separate
+//              shape for dark and bright pixels (beam_min/beam_max). BeamWidth +
+//              BeamSoftness cover the shape; the luminance-dependent part is
+//              left out because on a fixed 60 Hz panel it reads as flicker on
+//              dark content rather than as beam spread.
+//   mask       Guest's shadow_msk has 14 layouts. Three are worth a slider:
+//              grille (unbroken stripes), slot (staggered), dot (staggered and
+//              softer). Its mask_gamma/mask_drk/mask_lgt collapse to MaskGamma.
+//   glow       Guest separates glow from bloom/halation and gives each its own
+//              H and V radius and sigma (SIZEH/SIZEV/SIGMA_H/SIGMA_V). That
+//              separation is the single biggest reason it looks better than a
+//              ring blur, so it is kept: GlowX/GlowY are real radii, and the
+//              gaussian is separable (a true horizontal pass, then a vertical
+//              one) instead of a sampled ring.
+//   trims      Gamma input/output, black level, saturation, colour temperature.
+//              Guest's CRT-profile LUTs (P22, SMPTE-C, Trinitron) need 3D LUT
+//              textures and are not reproducible here.
+//   NOT taken  Persistence/afterglow (needs the previous frame, which Gamescope
+//              does not hand a pass), interlacing and rolling scan (a strobe on
+//              a 60 Hz panel), hum bars, TATE, integer scaling, noise.
+//
+// Written for Gamescope's reshadefx, a subset of ReShade FX. Every idiom here
+// was proven to compile on gamescope 3.16.31-ogc2+:
 //   - no fmod (use frac)
 //   - no scalar vector splats (float3(1.0) is rejected; write all three)
 //   - no implicit vector truncation (X3206 is fatal here)
@@ -14,36 +37,52 @@
 //   - no annotations on uniforms; the plugin declares the sliders
 //
 // The raster geometry lives in crt-common.fxh and scales off SourceLines rather
-// than off the output grid. What the old version of this shader got wrong, in
-// order of how visible it was: a beam per two OUTPUT rows (invisible at 4K), a
-// triad per three OUTPUT columns (aliasing noise against the panel's own
-// stripes), a mask gain of 1/0.60 that clipped the lit channel green, and a
-// brightness fudge unrelated to the duty cycle. All four are gone.
+// than off the output grid.
 
 #include "crt-common.fxh"
 
 texture BackBufferTex : COLOR;
 sampler BackBuffer { Texture = BackBufferTex; };
 
-// No semantic on this one: Gamescope only creates a texture for declarations
-// without a semantic, and a missing intermediate would silently fall back to
-// the sharp frame (killing the glow) rather than failing loudly.
-texture BufferA { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; };
+// The glow chain runs at HALF RESOLUTION. Halation is entirely low-frequency, so
+// half-res costs nothing visible, and it makes a separable blur cheaper than the
+// single full-res ring it replaces: 18 taps over a quarter of the pixels against
+// 9 over all of them. No semantic on these, or Gamescope creates nothing and a
+// missing intermediate silently falls back to the sharp frame instead of
+// failing loudly.
+texture BufferA { Width = BUFFER_WIDTH / 2; Height = BUFFER_HEIGHT / 2; Format = RGBA8; };
 sampler SamplerA { Texture = BufferA; };
+texture BufferB { Width = BUFFER_WIDTH / 2; Height = BUFFER_HEIGHT / 2; Format = RGBA8; };
+sampler SamplerB { Texture = BufferB; };
 
-uniform float SourceLines = 240;   // scanlines the emulated tube had
+uniform float SourceLines = 240;
 uniform float ScanIntensity = 0.35;
+uniform float BeamWidth = 0.50;
+uniform float BeamSoftness = 1.00;
+uniform float MaskType = 1.0;
 uniform float MaskStrength = 0.18;
-uniform float MaskScale = 1.0;     // 1.0 = one triad per source pixel
-uniform float GlowAmount = 0.30;   // halation
-uniform float Curvature = 0.10;
-uniform float BeamWidth = 0.50;    // bright fraction of a line; the rest is gap
-uniform float Vignette = 0.20;
+uniform float MaskScale = 1.0;
+uniform float MaskGamma = 1.0;
+uniform float GlowAmount = 0.30;
+uniform float GlowX = 3.0;
+uniform float GlowY = 3.0;
+uniform float GlowThreshold = 0.0;
 uniform float Sharpness = 0.25;
+uniform float Convergence = 0.50;
+uniform float CurvatureX = 0.10;
+uniform float CurvatureY = 0.10;
+uniform float Vignette = 0.20;
+uniform float CornerSize = 0.0;
+uniform float Overscan = 0.0;
+uniform float Brightness = 1.00;
+uniform float Gamma = 1.0;
+uniform float BlackLevel = 0.0;
+uniform float Saturation = 1.0;
+uniform float ColorTemp = 0.5;
 
-// Stripe edge width in stripe units, shared by the pattern and by the divisor
-// that restores the picture's average brightness.
-#define MASK_SOFT 0.35
+// Taps per side of the gaussian. 4 each side is 9 samples over the radius,
+// which is plenty for a signal that is by definition blurry.
+#define GLOW_TAPS 4
 
 void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
@@ -52,81 +91,140 @@ void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, 
     position = float4(texcoord * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
 }
 
-// Pass 0: the halation source. Two scales of blur in one pass, 9 taps, because
-// halation is entirely low-frequency: what matters is that light spreads a few
-// source pixels, not the exact kernel. The 5x5 this replaced was more expensive
-// AND narrower.
-float4 GlowPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
+// Weighted by its own brightness, so the halo comes from what is actually
+// bright. Without the weight the glow is a flat haze over the whole picture and
+// everything looks washed out, which is the most common way a CRT shader is
+// "wrong" and the hardest to attribute.
+float3 BrightPass(float2 uv)
 {
-    float2 px = float2(1.0 / BUFFER_WIDTH, 1.0 / BUFFER_HEIGHT);
-    float3 sum = tex2D(BackBuffer, texcoord).rgb * 0.34;
-    // Tight ring: 4 taps at 3 output pixels, which softens the beam itself.
-    sum += (tex2D(BackBuffer, texcoord + float2(px.x, 0.0) * 3.0).rgb
-          + tex2D(BackBuffer, texcoord - float2(px.x, 0.0) * 3.0).rgb
-          + tex2D(BackBuffer, texcoord + float2(0.0, px.y) * 3.0).rgb
-          + tex2D(BackBuffer, texcoord - float2(0.0, px.y) * 3.0).rgb) * 0.12;
-    // Wide ring: 4 taps at 9 output pixels, so the halo reaches past the
-    // scanline structure instead of only fattening the line it sits on.
-    sum += (tex2D(BackBuffer, texcoord + float2(px.x, 0.0) * 9.0).rgb
-          + tex2D(BackBuffer, texcoord - float2(px.x, 0.0) * 9.0).rgb
-          + tex2D(BackBuffer, texcoord + float2(0.0, px.y) * 9.0).rgb
-          + tex2D(BackBuffer, texcoord - float2(0.0, px.y) * 9.0).rgb) * 0.045;
-    return float4(sum, 1.0);
+    float3 c = tex2D(BackBuffer, uv).rgb;
+    float luma = dot(c, float3(0.299, 0.587, 0.114));
+    float w = saturate((luma - GlowThreshold) / max(1.0 - GlowThreshold, 0.01));
+    return c * w;
 }
 
-// Pass 1: the tube.
+// Horizontal pass. The radius is in SOURCE pixels, so the halo keeps its
+// physical size when the scanline count or the output resolution changes.
+float4 GlowHPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
+{
+    float src = BUFFER_HEIGHT / max(SourceLines, 1.0);
+    float r = max(GlowX, 0.0) * src / BUFFER_WIDTH;
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    int i;
+    for (i = -GLOW_TAPS; i <= GLOW_TAPS; i++)
+    {
+        float o = float(i) * 0.25;
+        float w = exp(-o * o * 1.8);
+        sum += BrightPass(texcoord + float2(o * r, 0.0)) * w;
+        wsum += w;
+    }
+    return float4(sum / wsum, 1.0);
+}
+
+// Vertical pass: this is the one that fills the scanline gaps, so it is
+// deliberately separable from the horizontal bleed rather than one isotropic
+// blur.
+float4 GlowVPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
+{
+    float src = BUFFER_HEIGHT / max(SourceLines, 1.0);
+    float r = max(GlowY, 0.0) * src / BUFFER_HEIGHT;
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    int i;
+    for (i = -GLOW_TAPS; i <= GLOW_TAPS; i++)
+    {
+        float o = float(i) * 0.25;
+        float w = exp(-o * o * 1.8);
+        sum += tex2D(SamplerA, texcoord + float2(0.0, o * r)).rgb * w;
+        wsum += w;
+    }
+    return float4(sum / wsum, 1.0);
+}
+
+// Pass 2: the tube.
 float4 CRTPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
-    float2 uv = CrtWarp(texcoord, Curvature);
+    // ---- screen geometry. Curvature is per-axis: a real tube is not equally
+    // curved both ways. Overscan zooms in to push the warped corners off-screen,
+    // which is what a set's overscan actually did.
+    float2 uv = CrtWarp2(texcoord, float2(CurvatureX, CurvatureY));
+    uv = (uv - 0.5) * (1.0 - 2.0 * saturate(Overscan)) + 0.5;
     float inside = CrtInside(uv);
     float2 clamped = float2(min(max(uv.x, 0.0), 1.0), min(max(uv.y, 0.0), 1.0));
-    float2 pixel = clamped * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
 
-    float pitch = CrtMaskPitch(SourceLines, 1.0);
-    float2 so = float2(pitch / BUFFER_WIDTH, pitch / BUFFER_HEIGHT);
+    float src = BUFFER_HEIGHT / max(SourceLines, 1.0);
+    float2 so = float2(src / BUFFER_WIDTH, src / BUFFER_HEIGHT);
 
-    // Chroma deconvergence: a quarter of a source pixel of radial fringing at
-    // the edges and none in the centre, the way a tube's three guns never line
-    // up perfectly. Radial, not a flat shift, so text stays clean mid-screen.
-    float2 rad = (clamped - 0.5) * so * 0.5;
+    // ---- convergence: R and B pulled apart radially at the edges and aligned
+    // in the centre, the way a tube's three guns never quite agree.
+    float2 rad = (clamped - 0.5) * so * max(Convergence, 0.0);
     float3 sharp = float3(tex2D(BackBuffer, clamped + rad).r,
                           tex2D(BackBuffer, clamped).g,
                           tex2D(BackBuffer, clamped - rad).b);
-    float3 glow = tex2D(SamplerA, clamped).rgb;
 
-    // Unsharp mask, so the softening can be dialled back instead of guessed at.
-    // The radius is one source pixel, so the control means the same thing at
-    // 1080p and at 4K. 4 taps.
+    // ---- sharpness: unsharp at one SOURCE pixel, so the control means the same
+    // thing at 1080p and at 4K. 4 taps of the sharp frame.
     float3 around = (tex2D(BackBuffer, clamped + float2(so.x, 0.0)).rgb
                    + tex2D(BackBuffer, clamped - float2(so.x, 0.0)).rgb
                    + tex2D(BackBuffer, clamped + float2(0.0, so.y)).rgb
                    + tex2D(BackBuffer, clamped - float2(0.0, so.y)).rgb) * 0.25;
     float3 base = sharp + (sharp - around) * Sharpness;
 
-    // Beam: bright across the middle of a source line, dark at the boundary.
-    float gap = 1.0 - min(max(BeamWidth, 0.05), 0.95);
-    float beam = CrtBeam(CrtLineEdge(clamped.y, SourceLines), gap);
+    // ---- beam. The line pattern is locked to the SCREEN, not to the warped
+    // image: the mask and the scanlines are part of the glass, and keeping them
+    // on the screen grid stops curvature from skewing their pitch.
+    float gap = 1.0 - min(max(BeamWidth, 0.05), 0.99);
+    float power = min(max(BeamSoftness, 0.2), 6.0);
+    float ramp = saturate(CrtLineEdge(texcoord.y, SourceLines) / max(gap, 0.001));
+    float beam = pow(ramp, power);
     float3 color = base * ((1.0 - ScanIntensity * (1.0 - beam))
-                           / CrtScanMean(ScanIntensity, gap));
+                           / CrtScanMeanPow(ScanIntensity, gap, power));
 
-    // Halation fills the gaps rather than hazing the whole picture: it is
-    // scaled by the gap itself, so it tracks the scanlines. GlowAmount is
-    // deliberately independent of ScanIntensity — turning the lines off must
-    // not take the halo with them.
+    // ---- halation fills the gaps rather than hazing the picture: scaled by the
+    // gap, so it tracks the beam. GlowAmount is deliberately independent of
+    // ScanIntensity, so turning the lines off keeps the halo.
+    float3 glow = tex2D(SamplerB, clamped).rgb;
     color += glow * GlowAmount * (1.0 - beam);
 
-    // Aperture grille: one triad per source pixel, MaskScale times that. Triads
-    // at the 4K output pitch are invisible from the couch and beat against the
-    // panel; source-pixel triads are what reads as a mask. Stagger 0 keeps the
-    // stripes unbroken.
+    // ---- mask.
     float mp = CrtMaskPitch(SourceLines, MaskScale);
-    color = CrtMask(color, CrtMaskPattern(pixel, mp, MASK_SOFT, 0.0, mp),
-                    MaskStrength);
-    color /= CrtMaskMean(MaskStrength, MASK_SOFT);
+    float msoft = (MaskType > 2.5) ? 0.50 : 0.35;
+    float stagger = (MaskType > 1.5) ? 0.5 : 0.0;
+    float3 lit = float3(1.0, 1.0, 1.0);
+    if (MaskType >= 0.5)
+    {
+        lit = CrtMaskPattern(texcoord * float2(BUFFER_WIDTH, BUFFER_HEIGHT),
+                             mp, msoft, stagger, mp);
+        lit = pow(max(lit, float3(0.0, 0.0, 0.0)), MaskGamma);
+    }
+    // With the mask off the divisor must be 1, or "no mask" would brighten the
+    // picture by the amount the mask would have dimmed it.
+    float mmean = (MaskType >= 0.5) ? CrtMaskMean(MaskStrength, msoft) : 1.0;
+    color = CrtMask(color, lit, MaskStrength) / mmean;
 
-    // Vignette, strongest in the corners.
+    // ---- corners and vignette.
+    float corner = 1.0;
+    if (CornerSize > 0.001)
+    {
+        float2 q = abs(clamped - 0.5) - (0.5 - CornerSize);
+        float d = length(max(q, float2(0.0, 0.0))) - CornerSize;
+        corner = 1.0 - smoothstep(-0.02, 0.02, d);
+    }
     float2 cc = clamped - 0.5;
-    color *= 1.0 - Vignette * dot(cc, cc) * 1.2;
+    color *= corner * (1.0 - Vignette * dot(cc, cc) * 1.2);
+
+    // ---- display trims, after the raster so they mean what they say.
+    color *= Brightness;
+    // A monotone lift/crush: positive raises the black level and compresses the
+    // top, negative crushes the floor and stretches the highlights.
+    color = saturate(BlackLevel + color * (1.0 - BlackLevel));
+    color = pow(max(color, float3(0.0, 0.0, 0.0)), 1.0 / max(Gamma, 0.05));
+    float luma = dot(color, float3(0.299, 0.587, 0.114));
+    color = lerp(float3(luma, luma, luma), color, Saturation);
+    // Neutral at 0.5; the endpoints are the tube-era warm/cool ends.
+    color *= lerp(float3(0.94, 1.00, 1.06), float3(1.06, 1.00, 0.94), ColorTemp);
+    color = saturate(color);
 
     return float4(color * inside, 1.0);
 }
@@ -137,9 +235,15 @@ technique DeckyCRT
     {
         RenderTarget = BufferA;
         VertexShader = PostProcessVS;
-        PixelShader = GlowPS;
+        PixelShader = GlowHPS;
     }
     pass Pass1
+    {
+        RenderTarget = BufferB;
+        VertexShader = PostProcessVS;
+        PixelShader = GlowVPS;
+    }
+    pass Pass2
     {
         VertexShader = PostProcessVS;
         PixelShader = CRTPS;
