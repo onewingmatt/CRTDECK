@@ -1,11 +1,26 @@
 // DeckyCRT :: Green phosphor
-// Monochrome P1 green terminal look with halation glow.
+// Monochrome P1 green terminal tube with halation glow. Single pass.
+//
+// The raster comes from crt-common.fxh and scales off SourceLines. The old
+// two-OUTPUT-pixel grille was invisible at 4K, and its brightness compensation
+// ignored the duty cycle — which is why 0.85 was a reasonable-looking setting
+// for a pattern nobody could see.
+
+#include "crt-common.fxh"
 
 texture BackBufferTex : COLOR;
 sampler BackBuffer { Texture = BackBufferTex; };
 
+uniform float SourceLines = 240;
 uniform float ScanIntensity = 0.45;
+uniform float MaskStrength = 0.15;
 uniform float Glow = 0.35;
+
+#define BEAM_GAP 0.50
+
+// Stripe edge width in stripe units, shared by the pattern and by the
+// divisor that restores the picture's average brightness.
+#define MASK_SOFT 0.50
 
 void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
@@ -21,16 +36,20 @@ float4 GreenPhosphorPS(float4 position : SV_Position, float2 texcoord : TEXCOORD
 
     // P1 green phosphor.
     float3 color = luma * float3(0.25, 1.00, 0.30);
-    // Halation: bright areas bloom green.
+    // Halation: bright areas bloom green. luma^2 so only the bright half of the
+    // picture glows, which is what a phosphor does.
     color += Glow * luma * luma * float3(0.10, 0.45, 0.12);
 
-    // Faint vertical grille lines.
-    float col = floor(texcoord.x * BUFFER_WIDTH);
-    color *= 1.0 - 0.10 * step(1.0, (frac(col / 2.0) * 2.0));
+    // A monochrome tube's mask is a single-colour stripe structure, so one
+    // stripe of the triad is the whole pattern.
+    float pitch = CrtMaskPitch(SourceLines, 1.0);
+    float2 pixel = texcoord * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    float stripe = CrtGrille(pixel.x, pitch, MASK_SOFT).r;
+    color = CrtMask(color, float3(stripe, stripe, stripe), MaskStrength);
+    color /= CrtMaskMean(MaskStrength, MASK_SOFT);
 
-    float phase = frac(texcoord.y * BUFFER_HEIGHT * 0.5);
-    float band = smoothstep(0.0, 0.35, phase) * (1.0 - smoothstep(0.65, 1.0, phase));
-    color *= 1.0 - ScanIntensity * band;
+    float beam = CrtBeam(CrtLineEdge(texcoord.y, SourceLines), BEAM_GAP);
+    color *= (1.0 - ScanIntensity * (1.0 - beam)) / CrtScanMean(ScanIntensity, BEAM_GAP);
 
     // Gentle vignette.
     float2 cc = texcoord - 0.5;

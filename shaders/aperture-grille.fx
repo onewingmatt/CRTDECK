@@ -1,11 +1,26 @@
 // DeckyCRT :: Aperture grille
-// Trinitron-style vertical RGB stripes plus scanlines. Single pass.
+// Trinitron-style unbroken RGB stripes plus scanlines, flat screen, single pass.
+//
+// The raster comes from crt-common.fxh. Both patterns scale off SourceLines:
+// one scanline per source line, one triad per source pixel. The old version
+// drew its triad at three OUTPUT columns, which on a 4K panel is the panel's
+// own stripe pitch — it beat against it and read as shimmer rather than as a
+// mask.
+
+#include "crt-common.fxh"
 
 texture BackBufferTex : COLOR;
 sampler BackBuffer { Texture = BackBufferTex; };
 
+uniform float SourceLines = 240;
 uniform float ScanIntensity = 0.35;
-uniform float MaskStrength = 0.30;
+uniform float MaskStrength = 0.18;
+
+#define BEAM_GAP 0.55
+
+// Stripe edge width in stripe units, shared by the pattern and by the
+// divisor that restores the picture's average brightness.
+#define MASK_SOFT 0.35
 
 void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
@@ -18,20 +33,16 @@ float4 AperturePS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : S
 {
     float3 color = tex2D(BackBuffer, texcoord).rgb;
 
-    float phase = frac(texcoord.y * BUFFER_HEIGHT * 0.5);
-    float band = smoothstep(0.0, 0.35, phase) * (1.0 - smoothstep(0.65, 1.0, phase));
-    color *= 1.0 - ScanIntensity * band;
+    // Stagger 0 keeps the stripes unbroken, which is the whole point of a
+    // grille over a slot mask.
+    float pitch = CrtMaskPitch(SourceLines, 1.0);
+    float2 pixel = texcoord * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    color = CrtMask(color, CrtMaskPattern(pixel, pitch, MASK_SOFT, 0.0, pitch),
+                    MaskStrength);
+    color /= CrtMaskMean(MaskStrength, MASK_SOFT);
 
-    // Aperture grille: RGB triads, one triad = 3 output pixels.
-    float col = floor(texcoord.x * BUFFER_WIDTH);
-    float m = (frac(col / 3.0) * 3.0);
-    float3 triad = (m < 1.0) ? float3(1.00, 0.40, 0.40)
-                 : ((m < 2.0) ? float3(0.40, 1.00, 0.40)
-                              : float3(0.40, 0.40, 1.00));
-    // Each triad averages 0.60 per channel; dividing keeps average brightness constant.
-    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / 0.60), MaskStrength);
-
-    color *= 1.0 + ScanIntensity * 0.30;
+    float beam = CrtBeam(CrtLineEdge(texcoord.y, SourceLines), BEAM_GAP);
+    color *= (1.0 - ScanIntensity * (1.0 - beam)) / CrtScanMean(ScanIntensity, BEAM_GAP);
 
     return float4(color, 1.0);
 }

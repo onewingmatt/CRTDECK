@@ -1,11 +1,20 @@
 // DeckyCRT :: B&W TV
-// Grayscale tube: luma only, scanlines, vignette.
+// Grayscale tube: luma only, source-locked scanlines, vignette. Single pass.
+//
+// No mask on this one, on purpose: a monochrome set has no RGB triad structure
+// to emulate, and the old faint stripe pattern was at output-pixel pitch, i.e.
+// invisible at 4K and aliasing against the panel where it was not.
+
+#include "crt-common.fxh"
 
 texture BackBufferTex : COLOR;
 sampler BackBuffer { Texture = BackBufferTex; };
 
+uniform float SourceLines = 240;
 uniform float ScanIntensity = 0.40;
 uniform float Vignette = 0.50;
+
+#define BEAM_GAP 0.50
 
 void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
@@ -20,14 +29,11 @@ float4 BWTVPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Ta
     float luma = dot(rgb, float3(0.299, 0.587, 0.114));
     float3 color = float3(luma, luma, luma);
 
-    float phase = frac(texcoord.y * BUFFER_HEIGHT * 0.5);
-    float band = smoothstep(0.0, 0.35, phase) * (1.0 - smoothstep(0.65, 1.0, phase));
-    color *= 1.0 - ScanIntensity * band;
+    float beam = CrtBeam(CrtLineEdge(texcoord.y, SourceLines), BEAM_GAP);
+    color *= (1.0 - ScanIntensity * (1.0 - beam)) / CrtScanMean(ScanIntensity, BEAM_GAP);
 
     float2 cc = texcoord - 0.5;
     color *= 1.0 - dot(cc, cc) * Vignette;
-
-    color *= 1.0 + ScanIntensity * 0.25;
 
     return float4(color, 1.0);
 }

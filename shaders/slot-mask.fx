@@ -1,13 +1,24 @@
 // DeckyCRT :: Slot mask + curve
-// Shadow-mask slots staggered per row, barrel curvature and vignette.
-// The full tube. Single pass.
+// Staggered slot mask, barrel curvature, vignette. The full tube, single pass.
+//
+// The raster comes from crt-common.fxh and scales off SourceLines: one scanline
+// per source line, one triad per source pixel, staggered every other mask row.
+
+#include "crt-common.fxh"
 
 texture BackBufferTex : COLOR;
 sampler BackBuffer { Texture = BackBufferTex; };
 
+uniform float SourceLines = 240;
 uniform float ScanIntensity = 0.35;
-uniform float MaskStrength = 0.35;
+uniform float MaskStrength = 0.20;
 uniform float Curvature = 0.10;
+
+#define BEAM_GAP 0.50
+
+// Stripe edge width in stripe units, shared by the pattern and by the
+// divisor that restores the picture's average brightness.
+#define MASK_SOFT 0.35
 
 void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
@@ -18,34 +29,28 @@ void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, 
 
 float4 SlotMaskPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
-    // Barrel curvature: pull UVs toward the center proportional to radius^2.
-    float2 cc = texcoord - 0.5;
-    float r2 = dot(cc, cc);
-    float2 uv = texcoord + cc * r2 * Curvature;
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
-        return float4(0.0, 0.0, 0.0, 1.0);
+    float2 uv = CrtWarp(texcoord, Curvature);
+    float inside = CrtInside(uv);
+    float2 clamped = float2(min(max(uv.x, 0.0), 1.0), min(max(uv.y, 0.0), 1.0));
 
-    float3 color = tex2D(BackBuffer, uv).rgb;
+    float3 color = tex2D(BackBuffer, clamped).rgb;
 
-    float phase = frac(uv.y * BUFFER_HEIGHT * 0.5);
-    float band = smoothstep(0.0, 0.35, phase) * (1.0 - smoothstep(0.65, 1.0, phase));
-    color *= 1.0 - ScanIntensity * band;
+    // Stagger 0.5: every other mask row shifts by half a triad, so the slots
+    // interlock instead of lining up into stripes.
+    float pitch = CrtMaskPitch(SourceLines, 1.0);
+    float2 pixel = clamped * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    color = CrtMask(color, CrtMaskPattern(pixel, pitch, MASK_SOFT, 0.5, pitch),
+                    MaskStrength);
+    color /= CrtMaskMean(MaskStrength, MASK_SOFT);
 
-    // Slot mask: RGB triads staggered by half a triad on alternate rows.
-    float row = floor(uv.y * BUFFER_HEIGHT);
-    float col = floor(uv.x * BUFFER_WIDTH + (frac(row / 2.0) * 2.0) * 1.5);
-    float m = (frac(col / 3.0) * 3.0);
-    float3 triad = (m < 1.0) ? float3(1.00, 0.40, 0.40)
-                 : ((m < 2.0) ? float3(0.40, 1.00, 0.40)
-                              : float3(0.40, 0.40, 1.00));
-    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / 0.60), MaskStrength);
+    float beam = CrtBeam(CrtLineEdge(clamped.y, SourceLines), BEAM_GAP);
+    color *= (1.0 - ScanIntensity * (1.0 - beam)) / CrtScanMean(ScanIntensity, BEAM_GAP);
 
-    // Vignette sells the tube.
-    color *= 1.0 - r2 * 0.55;
+    // Vignette sells the glass.
+    float2 cc = clamped - 0.5;
+    color *= 1.0 - dot(cc, cc) * 0.55;
 
-    color *= 1.0 + ScanIntensity * 0.30;
-
-    return float4(color, 1.0);
+    return float4(color * inside, 1.0);
 }
 
 technique DeckyCRT

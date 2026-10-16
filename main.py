@@ -114,6 +114,19 @@ def _ssl_context():
         return ssl.create_default_context()
 
 
+def _source_lines(default=240):
+    """How many scanlines the emulated tube had.
+
+    Every bundled shader derives its scanline and mask pitch from this instead
+    of from the output resolution. On a 4K panel a scanline every two OUTPUT
+    rows is a flat grey veil and a triad every three OUTPUT columns beats
+    against the panel's own stripes, so the pattern has to scale with the tube:
+    224 an arcade monitor, 240 a 15 kHz TV, 272 the PPSSPP CRT shader, 480 a PVM.
+    """
+    return _param("SourceLines", "Source lines", default, minv=120, maxv=540,
+                  step=1)
+
+
 PRESETS = [
     {
         "id": "scanlines",
@@ -121,7 +134,10 @@ PRESETS = [
         "description": "Clean dark scanlines. Cheapest option, suits any game.",
         "file": LIGHT_SUBDIR + "/scanlines.fx",
         "heavy": False,
-        "params": [_param("ScanIntensity", "Scanline intensity", 0.40)],
+        "params": [
+            _param("ScanIntensity", "Scanline intensity", 0.40),
+            _source_lines(),
+        ],
     },
     {
         "id": "aperture-grille",
@@ -131,7 +147,8 @@ PRESETS = [
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.35),
-            _param("MaskStrength", "Grille strength", 0.30),
+            _param("MaskStrength", "Grille strength", 0.18),
+            _source_lines(),
         ],
     },
     {
@@ -142,8 +159,9 @@ PRESETS = [
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.35),
-            _param("MaskStrength", "Mask strength", 0.35),
+            _param("MaskStrength", "Mask strength", 0.20),
             _param("Curvature", "Screen curvature", 0.10, maxv=0.30, step=0.01),
+            _source_lines(),
         ],
     },
     {
@@ -154,7 +172,8 @@ PRESETS = [
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.35),
-            _param("MaskStrength", "Mask strength", 0.35),
+            _param("MaskStrength", "Mask strength", 0.20),
+            _source_lines(),
         ],
     },
     {
@@ -165,7 +184,8 @@ PRESETS = [
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.30),
-            _param("MaskStrength", "Mask strength", 0.40),
+            _param("MaskStrength", "Mask strength", 0.22),
+            _source_lines(),
         ],
     },
     {
@@ -177,6 +197,8 @@ PRESETS = [
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.45),
             _param("Glow", "Phosphor glow", 0.35),
+            _param("MaskStrength", "Grille strength", 0.15),
+            _source_lines(),
         ],
     },
     {
@@ -188,6 +210,8 @@ PRESETS = [
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.45),
             _param("Glow", "Phosphor glow", 0.35),
+            _param("MaskStrength", "Grille strength", 0.15),
+            _source_lines(),
         ],
     },
     {
@@ -199,6 +223,7 @@ PRESETS = [
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.40),
             _param("Vignette", "Vignette", 0.50),
+            _source_lines(),
         ],
     },
     {
@@ -210,6 +235,7 @@ PRESETS = [
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.35),
             _param("Bleed", "Color bleed", 0.60),
+            _source_lines(),
         ],
     },
     {
@@ -222,6 +248,7 @@ PRESETS = [
             _param("ScanIntensity", "Scanline intensity", 0.40),
             _param("Bleed", "Color bleed", 0.70),
             _param("Curvature", "Screen curvature", 0.12, maxv=0.30, step=0.01),
+            _source_lines(),
         ],
     },
     {
@@ -232,7 +259,8 @@ PRESETS = [
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.50),
-            _param("MaskStrength", "Grille strength", 0.45),
+            _param("MaskStrength", "Grille strength", 0.25),
+            _source_lines(480),
         ],
     },
     {
@@ -243,8 +271,9 @@ PRESETS = [
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.50),
-            _param("MaskStrength", "Mask strength", 0.50),
+            _param("MaskStrength", "Mask strength", 0.25),
             _param("Curvature", "Screen curvature", 0.14, maxv=0.30, step=0.01),
+            _source_lines(224),
         ],
     },
     {
@@ -255,27 +284,31 @@ PRESETS = [
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.40),
-            _param("MaskStrength", "Grille strength", 0.35),
+            _param("MaskStrength", "Grille strength", 0.22),
             _param("Curvature", "Screen curvature", 0.12, maxv=0.30, step=0.01),
+            _source_lines(),
         ],
     },
     {
         "id": "crt-pro",
         "name": "CRT Pro",
-        "description": ("Two-pass aperture grille: a blurred halation pass, "
-                        "then beam profile, triad mask and curvature."),
+        "description": ("Two-pass aperture grille: halation pass, then beam "
+                        "profile, source-locked grille and curvature."),
         "file": LIGHT_SUBDIR + "/crt-pro.fx",
         "heavy": False,
         "params": [
             _param("ScanIntensity", "Scanline intensity", 0.35),
-            _param("MaskStrength", "Grille strength", 0.25),
-            _param("GlowAmount", "Glow", 0.15),
-            _param("Curvature", "Screen curvature", 0.10, maxv=0.30,
-                   step=0.01),
+            _param("MaskStrength", "Grille strength", 0.18),
+            _param("MaskScale", "Grille pitch (x source pixel)", 1.0,
+                   minv=1.0, maxv=3.0, step=0.05),
             _param("BeamWidth", "Beam width", 0.50, minv=0.05, maxv=0.90,
+                   step=0.01),
+            _param("GlowAmount", "Glow", 0.30),
+            _param("Curvature", "Screen curvature", 0.10, maxv=0.30,
                    step=0.01),
             _param("Vignette", "Vignette", 0.20),
             _param("Sharpness", "Sharpness", 0.25),
+            _source_lines(),
         ],
     },
     {
@@ -380,7 +413,10 @@ class Plugin:
             return False
         os.makedirs(dst, exist_ok=True)
         for name in os.listdir(src):
-            if name.endswith(".fx"):
+            # .fxh ships too: every bundled shader includes crt-common.fxh, and
+            # a copy without it fails at line 1 with "could not open included
+            # file" — fourteen dead presets, silently.
+            if name.endswith(".fx") or name.endswith(".fxh"):
                 shutil.copy2(os.path.join(src, name), os.path.join(dst, name))
         decky.logger.info("DeckyCRT: light shaders installed to %s", dst)
         return True

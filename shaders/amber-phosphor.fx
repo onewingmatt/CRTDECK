@@ -1,11 +1,24 @@
 // DeckyCRT :: Amber phosphor
-// Monochrome amber terminal look with halation glow.
+// Monochrome amber terminal tube with halation glow. Single pass.
+//
+// Shares crt-common.fxh with the green phosphor; only the tint and the bloom
+// colour are different.
+
+#include "crt-common.fxh"
 
 texture BackBufferTex : COLOR;
 sampler BackBuffer { Texture = BackBufferTex; };
 
+uniform float SourceLines = 240;
 uniform float ScanIntensity = 0.45;
+uniform float MaskStrength = 0.15;
 uniform float Glow = 0.35;
+
+#define BEAM_GAP 0.50
+
+// Stripe edge width in stripe units, shared by the pattern and by the
+// divisor that restores the picture's average brightness.
+#define MASK_SOFT 0.50
 
 void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
@@ -24,13 +37,14 @@ float4 AmberPhosphorPS(float4 position : SV_Position, float2 texcoord : TEXCOORD
     // Halation: bright areas bloom warm.
     color += Glow * luma * luma * float3(0.45, 0.25, 0.05);
 
-    // Faint vertical grille lines.
-    float col = floor(texcoord.x * BUFFER_WIDTH);
-    color *= 1.0 - 0.10 * step(1.0, (frac(col / 2.0) * 2.0));
+    float pitch = CrtMaskPitch(SourceLines, 1.0);
+    float2 pixel = texcoord * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    float stripe = CrtGrille(pixel.x, pitch, MASK_SOFT).r;
+    color = CrtMask(color, float3(stripe, stripe, stripe), MaskStrength);
+    color /= CrtMaskMean(MaskStrength, MASK_SOFT);
 
-    float phase = frac(texcoord.y * BUFFER_HEIGHT * 0.5);
-    float band = smoothstep(0.0, 0.35, phase) * (1.0 - smoothstep(0.65, 1.0, phase));
-    color *= 1.0 - ScanIntensity * band;
+    float beam = CrtBeam(CrtLineEdge(texcoord.y, SourceLines), BEAM_GAP);
+    color *= (1.0 - ScanIntensity * (1.0 - beam)) / CrtScanMean(ScanIntensity, BEAM_GAP);
 
     // Gentle vignette.
     float2 cc = texcoord - 0.5;

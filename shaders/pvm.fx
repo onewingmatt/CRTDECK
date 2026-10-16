@@ -1,11 +1,26 @@
 // DeckyCRT :: PVM
-// Broadcast monitor: sharp image, fine grille, strong scanlines, flat screen.
+// Broadcast monitor: sharp image, fine punchy grille, strong scanlines, flat
+// screen. Single pass.
+//
+// A PVM is a 480-line monitor, so the default SourceLines is 480 and the beam
+// is crisp (gap 0.35). The mask pitch is floored in crt-common.fxh, because one
+// triad per 480-line source pixel would be 4.5 output pixels at 4K — narrow
+// enough to alias.
+
+#include "crt-common.fxh"
 
 texture BackBufferTex : COLOR;
 sampler BackBuffer { Texture = BackBufferTex; };
 
+uniform float SourceLines = 480;
 uniform float ScanIntensity = 0.50;
-uniform float MaskStrength = 0.45;
+uniform float MaskStrength = 0.25;
+
+#define BEAM_GAP 0.35
+
+// Stripe edge width in stripe units, shared by the pattern and by the
+// divisor that restores the picture's average brightness.
+#define MASK_SOFT 0.30
 
 void PostProcessVS(in uint id : SV_VertexID, out float4 position : SV_Position, out float2 texcoord : TEXCOORD)
 {
@@ -18,21 +33,14 @@ float4 PVMPS(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Tar
 {
     float3 color = tex2D(BackBuffer, texcoord).rgb;
 
-    // Tight, strong scanlines.
-    float phase = frac(texcoord.y * BUFFER_HEIGHT * 0.5);
-    float band = smoothstep(0.05, 0.30, phase) * (1.0 - smoothstep(0.70, 0.95, phase));
-    color *= 1.0 - ScanIntensity * band;
+    float pitch = CrtMaskPitch(SourceLines, 1.0);
+    float2 pixel = texcoord * float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    color = CrtMask(color, CrtMaskPattern(pixel, pitch, MASK_SOFT, 0.0, pitch),
+                    MaskStrength);
+    color /= CrtMaskMean(MaskStrength, MASK_SOFT);
 
-    // Fine, punchy grille.
-    float col = floor(texcoord.x * BUFFER_WIDTH);
-    float m = (frac(col / 3.0) * 3.0);
-    float3 triad = (m < 1.0) ? float3(1.00, 0.30, 0.30)
-                 : ((m < 2.0) ? float3(0.30, 1.00, 0.30)
-                              : float3(0.30, 0.30, 1.00));
-    float triadAvg = (1.00 + 0.30 + 0.30) / 3.0;
-    color *= lerp(float3(1.0, 1.0, 1.0), triad * (1.0 / triadAvg), MaskStrength);
-
-    color *= 1.0 + ScanIntensity * 0.35;
+    float beam = CrtBeam(CrtLineEdge(texcoord.y, SourceLines), BEAM_GAP);
+    color *= (1.0 - ScanIntensity * (1.0 - beam)) / CrtScanMean(ScanIntensity, BEAM_GAP);
 
     return float4(color, 1.0);
 }
