@@ -478,10 +478,13 @@ PRESET_RANK = {
     "crt-royale": 150,
 }
 # Community shaders are ranked by the verdicts measured off-device
-# (community/verdicts.json) rather than by anyone's opinion of them.
+# (community/verdicts.json) rather than by anyone's opinion of them. A crash
+# sorts below a rejection: a rejected shader does nothing, a crashing one takes
+# the compositor and the panel with it.
 COMMUNITY_RANK_OK = 200
 COMMUNITY_RANK_UNTESTED = 210
 COMMUNITY_RANK_REJECT = 220
+COMMUNITY_RANK_CRASH = 250
 DEFAULT_RANK = 500
 
 DEFAULT_CONFIG = {
@@ -1106,16 +1109,18 @@ class Plugin:
 
     @staticmethod
     def _verdict_for(relpath: str, verdicts: dict) -> str:
-        """ok | untested | reject for one shader path.
+        """ok | untested | reject | crash for one shader path.
 
         Matched on the path suffix: the registry records a path inside the
         shader directory, while the config's relpath carries the plugin's own
-        subdirectory prefix.
+        subdirectory prefix. Crash is checked first, because a shader that
+        crashes the compositor can still print "Compiling pass" before it dies
+        and would otherwise be filed under ok.
         """
         rel = str(relpath or "")
         if not rel:
             return "untested"
-        for key in ("ok", "untested", "reject"):
+        for key in ("crash", "ok", "untested", "reject"):
             for recorded in (verdicts.get(key) or {}):
                 if rel.endswith(recorded):
                     return key
@@ -1126,7 +1131,8 @@ class Plugin:
             return PRESET_RANK.get(entry.get("id"), DEFAULT_RANK)
         return {"ok": COMMUNITY_RANK_OK,
                 "untested": COMMUNITY_RANK_UNTESTED,
-                "reject": COMMUNITY_RANK_REJECT}[
+                "reject": COMMUNITY_RANK_REJECT,
+                "crash": COMMUNITY_RANK_CRASH}[
                     self._verdict_for(entry.get("relpath", ""), verdicts)]
 
     # ------------------------------------------------------------------ status
@@ -1141,6 +1147,9 @@ class Plugin:
             if p["heavy"] and not entry["relpath"]:
                 entry["relpath"] = ""
             presets.append(entry)
+        crashes = verdicts.get("crash")
+        if not isinstance(crashes, dict):
+            crashes = {}
         rejections = verdicts.get("reject")
         if not isinstance(rejections, dict):
             rejections = {}
@@ -1150,16 +1159,29 @@ class Plugin:
             relpath = str(entry.get("relpath", ""))
             verdict = self._verdict_for(relpath, verdicts)
             entry["verdict"] = verdict
-            if verdict == "reject":
-                # Say it where the preset is picked, not in a log nobody reads.
-                reason = next((msg for path, msg in rejections.items()
+            # Say it where the preset is picked, not in a log nobody reads. Both
+            # dead ends are silent on the device: a rejected shader compiles to
+            # nothing, and a crashing one is only visible after the session is
+            # already gone.
+            if verdict in ("crash", "reject"):
+                table = crashes if verdict == "crash" else rejections
+                reason = next((msg for path, msg in table.items()
                                if relpath.endswith(path)), "")
                 where = f" ({reason})" if reason else ""
-                entry["name"] = f"{entry.get('name', '')} — won't load"
-                entry["description"] = (
-                    f"Gamescope's shader compiler rejects this one{where}, so "
-                    "selecting it does nothing. It is listed last for that "
-                    "reason. " + str(entry.get("description", "")))
+                if verdict == "crash":
+                    entry["name"] = f"{entry.get('name', '')} — crashes Gamescope"
+                    entry["description"] = (
+                        f"This shader crashes gamescope{where}. Selecting it "
+                        "takes the whole session down and the panel with it, and "
+                        "in per-game mode it leaves that game unable to launch "
+                        "until the wrapper is removed. It is listed last for "
+                        "that reason. " + str(entry.get("description", "")))
+                else:
+                    entry["name"] = f"{entry.get('name', '')} — won't load"
+                    entry["description"] = (
+                        f"Gamescope's shader compiler rejects this one{where}, so "
+                        "selecting it does nothing. It is listed last for that "
+                        "reason. " + str(entry.get("description", "")))
             presets.append(entry)
         # One place decides the order, and the panel just renders it.
         for entry in presets:

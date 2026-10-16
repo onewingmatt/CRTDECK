@@ -1,7 +1,7 @@
 {
   "measured": "2026-10-16",
   "gamescope": "3.16.31-ogc2+",
-  "how": "Nested gamescope, one shader at a time (--backend sdl, own window and Xwayland), verdict read from gamescope_reshade's own log lines. Same compiler the session uses; no shader was applied to the live session.",
+  "how": "Nested gamescope, one shader at a time (--backend sdl, own window and Xwayland). The verdict is the process EXIT STATUS plus gamescope_reshade's own log lines: a shader that crashes the compositor can still print 'Compiling pass' before it dies, so the log alone reads as success. Same compiler the session uses; no shader was applied to a live session.",
   "ok": [
     "crt-guest/Shaders/CRT-Guest-Advanced.fx",
     "crt-guest/Shaders/CRT-Guest-HD.fx",
@@ -59,12 +59,15 @@
     "rsretroarch/Shaders/crt-nes-mini.fx",
     "rsretroarch/Shaders/lcd-grid.fx",
     "rsretroarch/Shaders/mdapt.fx",
-    "rsretroarch/Shaders/nGlide_3DFX.fx",
     "rsretroarch/Shaders/ntsc.fx",
     "rsretroarch/Shaders/scanlines-fract.fx",
     "rsretroarch/Shaders/sgenpt-mix.fx",
     "rsretroarch/Shaders/zfast_crt.fx"
   ],
+  "crash": {
+    "rsretroarch/Shaders/EGAfilter.fx": "SIGSEGV while it builds the effect (gamescope exits 139)",
+    "rsretroarch/Shaders/nGlide_3DFX.fx": "SIGSEGV while it builds the effect (gamescope exits 139)"
+  },
   "reject": {
     "rsretroarch/Shaders/CRTCX.fx": "warning X3206",
     "rsretroarch/Shaders/CRTHyllian.fx": "warning X3206",
@@ -79,8 +82,5 @@
     "rsretroarch/Shaders/vt220.fx": "warning X3206",
     "rsretroarch/Shaders/vt220_frame.fx": "warning X3206",
     "rsretroarch/Shaders/vt220_night.fx": "warning X3206"
-  },
-  "untested": {
-    "rsretroarch/Shaders/EGAfilter.fx": "no compile line and no parse error \u2014 the technique produced no pass"
   }
 }
